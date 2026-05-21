@@ -132,24 +132,48 @@ def parse_number(s: str) -> float:
     return float(s)
 
 
+SELL_VERBS = ("продал", "продала", "продали", "отдал", "отдала", "отдали")
+BUY_VERBS = ("купил", "купила", "купили", "откупил", "откупила", "откупили",
+             "забрал", "забрала", "забрали")
+
+
+def _find_verb(lower: str):
+    """Ищем глагол sell/buy в первых ~30 символах. Возвращаем (kind, end_idx) или (None, None)."""
+    best = None
+    for kind, verbs in (("sell", SELL_VERBS), ("buy", BUY_VERBS)):
+        for v in verbs:
+            i = lower.find(v)
+            if 0 <= i <= 30:
+                before_ok = (i == 0) or not lower[i - 1].isalpha()
+                end = i + len(v)
+                after_ok = (end == len(lower)) or not lower[end].isalpha()
+                if before_ok and after_ok and (best is None or i < best[0]):
+                    best = (i, end, kind)
+    return (best[2], best[1]) if best else (None, None)
+
+
 def parse_trade(text: str):
     """
     Возвращает dict {kind, counterparty, usdt, rate, rubles} или None.
+    Поддерживает форматы:
+        Продал Гиге 475600/76.262
+        Купил у Стефа 1020*74
+        Влад продал Клиенту 96000/75.7
+        Влад купил у клиента 15000/72.1
+        Откупили у Москвы 2375700/73.551
     """
     text = text.strip()
     lower = text.lower()
 
-    if lower.startswith("продал"):
-        kind, rest = "sell", text[len("продал"):].lstrip()
-    elif lower.startswith("купил"):
-        kind = "buy"
-        rest = text[len("купил"):].lstrip()
-        for prefix in ("у ", "у\u00a0", "от "):
-            if rest.lower().startswith(prefix):
-                rest = rest[len(prefix):].lstrip()
-                break
-    else:
+    kind, verb_end = _find_verb(lower)
+    if not kind:
         return None
+
+    rest = text[verb_end:].lstrip()
+    for prefix in ("у ", "у\u00a0", "от ", "от\u00a0"):
+        if rest.lower().startswith(prefix):
+            rest = rest[len(prefix):].lstrip()
+            break
 
     # Находим первое выражение вида X*Y или X/Y
     m = re.search(rf"({NUM})\s*([*x×/÷:])\s*({NUM})", rest)
@@ -212,10 +236,10 @@ dp = Dispatcher()
 HELP_TEXT = (
     "👋 Я считаю твои сделки USDT.\n\n"
     "📝 *Пиши обычным текстом:*\n"
-    "• `Продал Гиге 475600/76.262` — продал на 475 600₽ по курсу 76,262\n"
-    "• `Продал Адахану 6500*76.5` — продал 6500 USDT по курсу 76,5\n"
-    "• `Купил у Стефа 1020*74` — купил 1020 USDT по курсу 74\n"
-    "• `Купил у Жени 300000/74.55` — отдал 300 000₽ по курсу 74,55\n\n"
+    "• `Продал Гиге 475600/76.262`\n"
+    "• `Купил у Стефа 1020*74`\n"
+    "• `Влад продал Клиенту 96000/75.7`\n"
+    "• `Откупили у Москвы 2375700/73.551`\n\n"
     "Правило простое:\n"
     "• `*` — слева USDT, справа курс\n"
     "• `/` — слева рубли, справа курс\n\n"
@@ -384,11 +408,12 @@ async def on_text(message: Message):
     if not parsed:
         # Если человек явно начал с «продал»/«купил», но формат сломан — подсказать.
         low = message.text.lower().strip()
-        if low.startswith(("продал", "купил")):
+        if any(v in low for v in ("продал", "купил", "откупил", "забрал")):
             await message.answer(
                 "Не понял формат. Используй:\n"
-                "`Продал [имя] [usdt]*[курс]`  → например `Продал Васе 1000*76`\n"
-                "`Купил у [имя] [рубли]/[курс]` → например `Купил у Васи 75000/74.5`",
+                "`Продал [имя] [usdt]*[курс]`  → `Продал Васе 1000*76`\n"
+                "`Купил у [имя] [рубли]/[курс]` → `Купил у Васи 75000/74.5`\n"
+                "`Влад продал [имя] [рубли]/[курс]` тоже работает",
                 parse_mode="Markdown")
         return
 
