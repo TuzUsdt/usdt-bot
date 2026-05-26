@@ -1,20 +1,33 @@
 """
-Telegram-бот для учёта USDT-сделок и денежных движений.
-Понимает:
-  Продал Гиге 475600/76.262        — USDT-сделка
-  Купил у Стефа 1020*74            — USDT-сделка
-  Влад продал Клиенту 96000/75.7   — USDT-сделка с указанием исполнителя
-  Откупили у Москвы 2375700/73.551 — USDT-сделка
+Telegram-бот для учёта USDT-сделок, кэш-движений и арбитражных сделок.
 
-  Выдал Владу 72 600               — кэш минус
-  Принял от Адахана 729 100        — кэш плюс
-  Забрали у Бабая 942 000          — кэш плюс
-  Влад выдал клиенту 30 000        — кэш минус
-  + 96000 от клиента               — кэш плюс
-  - 72600 Владу                    — кэш минус
+УМЕЕТ ПОНИМАТЬ:
+  USDT-сделки:
+    Продал Гиге 475600/76.262
+    Купил у Стефа 1020*74
+    Влад продал Клиенту 96000/75.7
 
-Можно несколько операций в одном сообщении — каждая на новой строке.
-Можно с номерами (1. ... 2. ...).
+  Кэш-движения (только рубли):
+    Выдал Владу 72 600
+    Принял от Адахана 729 100
+    + 96000 от клиента
+    - 72600 Владу
+
+  Арбитраж (сделка без своих средств):
+    Сделка без моих средств
+    Купил у Германа 196500/75=2620
+    Продал Стефу 196500/75.5=2602,649
+  → Профит +17.35 USDT, касса не меняется.
+
+ПОДТВЕРЖДЕНИЕ:
+  После сделки бот показывает кнопки [✅ Записать] [❌ Отмена].
+  По умолчанию подтверждаем USDT-сделки и арбитраж.
+  Кэш-движения по умолчанию записываются сразу (можно изменить через /confirm).
+
+ТИПЫ ЧАТОВ (/settype):
+  main   — личный чат: все операции
+  field  — чат сотрудника (Влада): сделки в поле
+  common — общая касса: приходы/расходы
 """
 
 import asyncio
@@ -34,7 +47,9 @@ except ImportError:
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
 
 # ────────────────── НАСТРОЙКИ ──────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -91,13 +106,12 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_trades_chat ON trades(chat_id, ts);
         """)
 
-        # Новая схема: единая таблица transactions с глобальными ID
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id        INTEGER NOT NULL,
                 ts             TEXT    NOT NULL,
-                type           TEXT    NOT NULL,  -- 'sell' | 'buy' | 'cash_in' | 'cash_out'
+                type           TEXT    NOT NULL,
                 counterparty   TEXT,
                 doer           TEXT,
                 usdt           REAL    DEFAULT 0,
@@ -111,7 +125,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_tx_party ON transactions(counterparty);
         """)
 
-        # Однократная миграция старых сделок
+        # v2: миграция из старой trades
         if version < 2:
             old_count = conn.execute("SELECT COUNT(*) AS c FROM trades").fetchone()["c"]
             if old_count > 0:
@@ -126,7 +140,39 @@ def init_db():
                 log.info(f"Перенёс {old_count} старых сделок в transactions.")
             conn.execute("PRAGMA user_version = 2")
 
+        # v3: добавляем status, batch_id, и поля для арбитража
+        if version < 3:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+            if "status" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN status TEXT DEFAULT 'confirmed'")
+            if "batch_id" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN batch_id INTEGER")
+            # Поля для арбитража: что получили / что отдали в USDT
+            if "usdt_in" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN usdt_in REAL DEFAULT 0")
+            if "usdt_out" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN usdt_out REAL DEFAULT 0")
+            if "partner_in" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN partner_in TEXT")
+            if "partner_out" not in cols:
+                conn.execute("ALTER TABLE transactions ADD COLUMN partner_out TEXT")
 
+            # Все старые транзакции — confirmed
+            conn.execute("UPDATE transactions SET status = 'confirmed' WHERE status IS NULL")
+            conn.execute("PRAGMA user_version = 3")
+            log.info("Применил миграцию v3 (status, batch_id, поля арбитража).")
+
+        # Настройки чата (тип, режим подтверждения)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id       INTEGER PRIMARY KEY,
+                chat_type     TEXT DEFAULT 'main',     -- 'main' | 'field' | 'common'
+                confirm_mode  TEXT DEFAULT 'trades'    -- 'all' | 'trades' | 'big' | 'off'
+            );
+        """)
+
+
+# ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
     with db() as conn:
         row = conn.execute("SELECT * FROM state WHERE chat_id = ?", (chat_id,)).fetchone()
@@ -146,26 +192,55 @@ def update_state(chat_id: int, d_rubles: float = 0, d_usdt: float = 0):
         )
 
 
-def save_tx(chat_id, type_, counterparty, rubles, usdt=0, rate=0, raw="", doer=None) -> int:
+# ───── Настройки чата ─────
+def get_chat_settings(chat_id: int) -> dict:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM chat_settings WHERE chat_id = ?", (chat_id,)).fetchone()
+        if not row:
+            conn.execute("INSERT INTO chat_settings (chat_id) VALUES (?)", (chat_id,))
+            return {"chat_id": chat_id, "chat_type": "main", "confirm_mode": "trades"}
+        return dict(row)
+
+
+def set_chat_setting(chat_id: int, **kw):
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (chat_id,))
+        for k, v in kw.items():
+            if k in ("chat_type", "confirm_mode"):
+                conn.execute(f"UPDATE chat_settings SET {k} = ? WHERE chat_id = ?", (v, chat_id))
+
+
+# ───── Сохранение транзакций ─────
+def save_tx(chat_id, type_, counterparty, rubles, *, usdt=0, rate=0, raw="",
+            doer=None, status="confirmed", batch_id=None,
+            usdt_in=0, usdt_out=0, partner_in=None, partner_out=None) -> int:
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO transactions (chat_id, ts, type, counterparty, doer, usdt, rate, rubles, raw_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transactions "
+            "(chat_id, ts, type, counterparty, doer, usdt, rate, rubles, raw_text, "
+            " status, batch_id, usdt_in, usdt_out, partner_in, partner_out) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (chat_id, datetime.utcnow().isoformat(), type_, counterparty, doer,
-             usdt, rate, rubles, raw)
+             usdt, rate, rubles, raw, status, batch_id,
+             usdt_in, usdt_out, partner_in, partner_out)
         )
         return cur.lastrowid
 
 
 def get_avg_rates(chat_id: int) -> dict:
+    """Средневзвешенные курсы — только по confirmed транзакциям."""
     with db() as conn:
         sell = conn.execute(
             "SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
-            "FROM transactions WHERE chat_id = ? AND type = 'sell'",
+            "FROM transactions WHERE chat_id = ? AND type = 'sell' AND status = 'confirmed'",
             (chat_id,)).fetchone()
         buy = conn.execute(
             "SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
-            "FROM transactions WHERE chat_id = ? AND type = 'buy'",
+            "FROM transactions WHERE chat_id = ? AND type = 'buy' AND status = 'confirmed'",
+            (chat_id,)).fetchone()
+        arb_profit = conn.execute(
+            "SELECT COALESCE(SUM(usdt),0) p FROM transactions "
+            "WHERE chat_id = ? AND type = 'arb' AND status = 'confirmed'",
             (chat_id,)).fetchone()
     return {
         "avg_sell":          (sell["r"] / sell["u"]) if sell["u"] else None,
@@ -174,6 +249,7 @@ def get_avg_rates(chat_id: int) -> dict:
         "total_bought_usdt": buy["u"],
         "total_received":    sell["r"],
         "total_spent":       buy["r"],
+        "arb_profit_usdt":   arb_profit["p"],
     }
 
 
@@ -192,14 +268,21 @@ CASH_IN_VERBS = ("принял", "приняла", "приняли", "прини
                  "забрал", "забрала", "забрали", "забирал", "забирали",
                  "получил", "получила", "получили", "получал", "получали")
 
+ARB_MARKERS = (
+    "сделка без моих средств",
+    "сделка без своих средств",
+    "арбитраж",
+    "партнёрская сделка",
+    "партнерская сделка",
+)
+
 
 def parse_number(s: str, prefer_decimal: bool = False) -> float:
     """
     Парсит '72 600' → 72600, '85.000' → 85000, '73.5' → 73.5,
     '1 142 400' → 1142400, '75,6' → 75.6, '1.000.000' → 1000000.
 
-    prefer_decimal=True — для курсов: запятая/точка всегда десятичные
-    (например, '73,551' → 73.551, а не 73551).
+    prefer_decimal=True — для курсов: единственный разделитель всегда десятичный.
     """
     s = s.strip().replace(" ", "").replace("\u00a0", "")
     s = s.rstrip("₽рp$ ").strip()
@@ -207,10 +290,8 @@ def parse_number(s: str, prefer_decimal: bool = False) -> float:
         raise ValueError("empty")
 
     if "." in s and "," in s:
-        # Оба разделителя: точка — тысячи, запятая — дробная часть
         s = s.replace(".", "").replace(",", ".")
     elif prefer_decimal:
-        # Для курсов — единственный разделитель всегда десятичный
         s = s.replace(",", ".")
     elif "." in s:
         parts = s.split(".")
@@ -236,7 +317,6 @@ def _find_verb(lower: str, verb_groups: list) -> tuple:
             i = lower.find(v)
             if i < 0 or i > 30:
                 continue
-            # Префикс до глагола: либо пусто, либо одно слово (исполнитель)
             before = lower[:i].strip()
             if before and " " in before:
                 continue
@@ -272,15 +352,11 @@ def parse_trade(text: str):
     counterparty = rest[:m.start()].strip().rstrip("—-:,.").strip() or "—"
     try:
         op = m.group(2)
+        a = parse_number(m.group(1))
+        b = parse_number(m.group(3), prefer_decimal=True)
         if op in "*x×":
-            # Слева USDT, справа курс. Курс — всегда десятичное.
-            a = parse_number(m.group(1))
-            b = parse_number(m.group(3), prefer_decimal=True)
             usdt, rate, rubles = a, b, a * b
         else:
-            # Слева рубли, справа курс. Курс — всегда десятичное.
-            a = parse_number(m.group(1))
-            b = parse_number(m.group(3), prefer_decimal=True)
             rubles, rate, usdt = a, b, a / b
     except (ValueError, ZeroDivisionError):
         return None
@@ -316,7 +392,6 @@ def parse_cash_flow(text: str):
     ])
 
     if not kind:
-        # Без глагола, но с явным знаком: "+ 96000 от клиента" / "- 72600 Владу"
         if not explicit_dir:
             return None
         m_amt = re.search(NUM_PATTERN, text)
@@ -337,7 +412,7 @@ def parse_cash_flow(text: str):
         counterparty = (before + " " + after).strip().strip(",:.") or "—"
         return {"type": explicit_dir, "doer": None, "counterparty": counterparty, "amount": amount}
 
-    direction = kind  # глагол приоритетнее знака
+    direction = kind
     doer = text[:vs].strip() or None
     rest = text[ve:].lstrip()
     for prep in ("у ", "у\u00a0", "от ", "от\u00a0", "из ", "к ", "для "):
@@ -361,13 +436,11 @@ def parse_cash_flow(text: str):
 
 
 def parse_message_line(line: str):
-    """Парсит одну строку. Сначала пробует сделку, потом кэш-движение."""
+    """Парсит одну строку: сначала сделку, потом кэш-движение."""
     line = line.strip()
-    # Снять префиксную нумерацию "1." или "1)"
     line = re.sub(r"^\d+\s*[\.\)]\s*", "", line).strip()
     if not line:
         return None
-
     t = parse_trade(line)
     if t:
         return t
@@ -375,6 +448,78 @@ def parse_message_line(line: str):
     if c:
         return c
     return None
+
+
+def parse_arbitrage_message(text: str):
+    """
+    Арбитраж: маркер + 2 trade-формат блока.
+    Касса не меняется, в кошелёк падает разница USDT (профит).
+
+    Пример:
+        Сделка без моих средств
+
+        Продал Стефу
+        196500/75.5=2 602,649
+
+        Купил у Германа
+        196500/75=2 620
+
+    Возвращает dict или None.
+    """
+    lower_full = text.lower()
+    if not any(m in lower_full for m in ARB_MARKERS):
+        return None
+
+    # Делим сообщение на блоки по пустым строкам
+    blocks = re.split(r"\n\s*\n", text)
+
+    # В каждом блоке склеиваем строки в одну, пропуская маркер
+    trades = []
+    for block in blocks:
+        lines = []
+        for line in block.split("\n"):
+            line = re.sub(r"^\d+\s*[\.\)]\s*", "", line.strip()).strip()
+            if not line:
+                continue
+            if any(m in line.lower() for m in ARB_MARKERS):
+                continue
+            lines.append(line)
+        if not lines:
+            continue
+        joined = " ".join(lines)
+        t = parse_trade(joined)
+        if t:
+            trades.append((joined, t))
+
+    if len(trades) < 2:
+        return None
+
+    # Берём первые 2 сделки
+    (raw_a, a), (raw_b, b) = trades[0], trades[1]
+
+    # Та, что больше USDT — это что мы получили; меньшая — что отдали.
+    if a["usdt"] >= b["usdt"]:
+        got, sent = a, b
+    else:
+        got, sent = b, a
+
+    profit = round(got["usdt"] - sent["usdt"], 4)
+
+    # Sanity check: профит не должен быть нулевым/отрицательным и не больше 30% от объёма
+    if profit <= 0 or profit > got["usdt"] * 0.30:
+        return None
+
+    return {
+        "type": "arb",
+        "partner_in": got["counterparty"],
+        "partner_out": sent["counterparty"],
+        "usdt_in": got["usdt"],
+        "usdt_out": sent["usdt"],
+        "rub_amount": round(max(got["rubles"], sent["rubles"]), 2),
+        "rate_in": got["rate"],
+        "rate_out": sent["rate"],
+        "profit": profit,
+    }
 
 
 # ────────────────── ФОРМАТИРОВАНИЕ ──────────────────
@@ -409,24 +554,79 @@ def fmt_tx_short(r) -> str:
     tid = fmt_id(r["id"])
     cp = r["counterparty"] or "—"
     t = r["type"]
+    pending = " ⏳" if (r["status"] if "status" in r.keys() else "confirmed") == "pending" else ""
     if t == "sell":
-        return f"{tid} 📤 Продал {cp}: {fmt_usdt(r['usdt'])} × {fmt_rate(r['rate'])} = {fmt_rub(r['rubles'])}"
+        return f"{tid}{pending} 📤 Продал {cp}: {fmt_usdt(r['usdt'])} × {fmt_rate(r['rate'])} = {fmt_rub(r['rubles'])}"
     if t == "buy":
-        return f"{tid} 📥 Купил у {cp}: {fmt_usdt(r['usdt'])} × {fmt_rate(r['rate'])} = {fmt_rub(r['rubles'])}"
+        return f"{tid}{pending} 📥 Купил у {cp}: {fmt_usdt(r['usdt'])} × {fmt_rate(r['rate'])} = {fmt_rub(r['rubles'])}"
     if t == "cash_out":
-        return f"{tid} 💸 Выдал {cp}: −{fmt_rub(r['rubles'])}"
+        return f"{tid}{pending} 💸 Выдал {cp}: −{fmt_rub(r['rubles'])}"
     if t == "cash_in":
-        return f"{tid} 💰 Принял {cp}: +{fmt_rub(r['rubles'])}"
-    return f"{tid} {t}: {fmt_rub(r['rubles'])}"
+        return f"{tid}{pending} 💰 Принял {cp}: +{fmt_rub(r['rubles'])}"
+    if t == "arb":
+        pin = r["partner_in"] if "partner_in" in r.keys() else "?"
+        pout = r["partner_out"] if "partner_out" in r.keys() else "?"
+        return f"{tid}{pending} 🔄 Арбитраж {pin}→{pout}: +{fmt_usdt(r['usdt'])} профит"
+    return f"{tid}{pending} {t}: {fmt_rub(r['rubles'])}"
+
+
+# ────────────────── ЛОГИКА ПРИМЕНЕНИЯ БАЛАНСА ──────────────────
+def apply_balance(chat_id: int, tx_row) -> None:
+    """Применяет влияние подтверждённой транзакции на кассу/кошелёк."""
+    t = tx_row["type"]
+    if t == "sell":
+        update_state(chat_id, d_rubles=tx_row["rubles"], d_usdt=-tx_row["usdt"])
+    elif t == "buy":
+        update_state(chat_id, d_rubles=-tx_row["rubles"], d_usdt=tx_row["usdt"])
+    elif t == "cash_in":
+        update_state(chat_id, d_rubles=tx_row["rubles"])
+    elif t == "cash_out":
+        update_state(chat_id, d_rubles=-tx_row["rubles"])
+    elif t == "arb":
+        # Касса не меняется, в кошелёк падает только разница (profit, лежит в поле usdt)
+        update_state(chat_id, d_usdt=tx_row["usdt"])
+
+
+def reverse_balance(chat_id: int, tx_row) -> None:
+    """Откатывает влияние транзакции."""
+    t = tx_row["type"]
+    if t == "sell":
+        update_state(chat_id, d_rubles=-tx_row["rubles"], d_usdt=tx_row["usdt"])
+    elif t == "buy":
+        update_state(chat_id, d_rubles=tx_row["rubles"], d_usdt=-tx_row["usdt"])
+    elif t == "cash_in":
+        update_state(chat_id, d_rubles=-tx_row["rubles"])
+    elif t == "cash_out":
+        update_state(chat_id, d_rubles=tx_row["rubles"])
+    elif t == "arb":
+        update_state(chat_id, d_usdt=-tx_row["usdt"])
+
+
+def should_confirm(parsed: dict, settings: dict) -> bool:
+    """Нужно ли подтверждать через кнопки?"""
+    mode = settings.get("confirm_mode", "trades")
+    if mode == "off":
+        return False
+    if mode == "all":
+        return True
+    t = parsed["type"]
+    if mode == "trades":
+        return t in ("sell", "buy", "arb")
+    if mode == "big":
+        amt = parsed.get("rubles") or parsed.get("amount") or parsed.get("rub_amount") or 0
+        return amt >= 100000
+    return False
 
 
 # ────────────────── БОТ ──────────────────
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-HELP_TEXT = (
-    "👋 Я веду учёт USDT-сделок и денежных движений.\n\n"
-    "📝 *USDT-сделки* (меняют ₽ и USDT):\n"
+
+HELP_MAIN = (
+    "👋 Я веду учёт USDT-сделок, кэш-движений и арбитража.\n"
+    "_Тип чата:_ *main* (твой личный — пишешь все операции)\n\n"
+    "📝 *USDT-сделки* (меняют ₽ и USDT, требуют подтверждения):\n"
     "`Продал Гиге 475600/76.262`\n"
     "`Купил у Стефа 1020*74`\n"
     "`Влад продал Клиенту 96000/75.7`\n"
@@ -434,27 +634,107 @@ HELP_TEXT = (
     "💵 *Кэш-движения* (меняют только ₽):\n"
     "`Выдал Владу 72 600`\n"
     "`Принял от Адахана 729 100`\n"
-    "`Забрали у Бабая 942 000`\n"
-    "`+ 96000 от клиента`\n"
-    "`- 72600 Владу`\n\n"
-    "Можно несколько операций в одном сообщении — каждая на новой строке. "
-    "Бот игнорирует нумерацию `1.`/`2.` в начале.\n\n"
+    "`+ 96000 от клиента`\n\n"
+    "🔄 *Арбитраж* (касса не меняется, в кошелёк падает спред):\n"
+    "```\nСделка без моих средств\n"
+    "Купил у Германа 196500/75=2620\n"
+    "Продал Стефу 196500/75.5=2602\n```\n"
     "📊 *Команды:*\n"
-    "/balance — касса и USDT\n"
-    "/stats — средние курсы, спред, прибыль\n"
-    "/history — последние 15 операций\n"
-    "/cashflow — последние 20 кэш-движений\n"
-    "/find — поиск по ID, имени или сумме\n"
-    "/undo — отменить последнюю операцию\n"
-    "/setcash — задать стартовую кассу\n"
-    "/help — эта памятка"
+    "/balance · /stats · /history · /cashflow · /find\n"
+    "/undo · /pending · /setcash · /settype · /confirm · /help"
 )
+
+HELP_FIELD = (
+    "👋 Это рабочий чат сотрудника (поле).\n"
+    "_Тип чата:_ *field* — операции сотрудника\n\n"
+    "📝 *Сделки в поле:*\n"
+    "`Влад купил у клиента 78200/73.5`\n"
+    "`Влад продал клиенту 96000/75.7`\n\n"
+    "💵 *Кэш на руках:*\n"
+    "`Выдали Владу 72 600` _(из общей кассы → на руки Владу)_\n"
+    "`Принял от клиента 96 000` _(клиент дал нал)_\n"
+    "`Влад выдал клиенту 30 000`\n\n"
+    "📊 *Команды:*\n"
+    "/balance · /history · /cashflow · /find · /undo · /pending · /settype · /help"
+)
+
+HELP_COMMON = (
+    "👋 Это чат общей кассы.\n"
+    "_Тип чата:_ *common* — приходы и расходы общего котла\n\n"
+    "💵 *Шаблоны:*\n"
+    "`Принял от Влада 500 000` _(Влад сдал в кассу)_\n"
+    "`Принял от Ивана 800 000` _(Иван внёс в кассу)_\n"
+    "`Выдал Владу 100 000` _(касса → Владу на оборотку)_\n"
+    "`Выдал на расходы 30 000`\n\n"
+    "📊 *Команды:*\n"
+    "/balance · /cashflow · /find · /undo · /history · /settype · /help"
+)
+
+
+def help_text(chat_id: int) -> str:
+    s = get_chat_settings(chat_id)
+    if s["chat_type"] == "field":
+        return HELP_FIELD
+    if s["chat_type"] == "common":
+        return HELP_COMMON
+    return HELP_MAIN
+
+
+def confirm_kb(batch_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Записать", callback_data=f"c:{batch_id}"),
+        InlineKeyboardButton(text="❌ Отмена",   callback_data=f"x:{batch_id}"),
+    ]])
 
 
 @dp.message(CommandStart())
 @dp.message(Command("help"))
 async def on_start(message: Message):
-    await message.answer(HELP_TEXT, parse_mode="Markdown")
+    await message.answer(help_text(message.chat.id), parse_mode="Markdown")
+
+
+@dp.message(Command("settype"))
+async def on_settype(message: Message):
+    parts = message.text.split(maxsplit=1)
+    s = get_chat_settings(message.chat.id)
+    if len(parts) < 2:
+        await message.answer(
+            f"Сейчас тип чата: *{s['chat_type']}*\n\n"
+            "Доступные:\n"
+            "• `/settype main` — твой личный чат (все операции)\n"
+            "• `/settype field` — чат сотрудника в поле\n"
+            "• `/settype common` — общая касса\n\n"
+            "Тип меняет только подсказки и шаблоны в `/help`, а команды и парсер работают одинаково.",
+            parse_mode="Markdown")
+        return
+    new_type = parts[1].strip().lower()
+    if new_type not in ("main", "field", "common"):
+        await message.answer("Тип должен быть main, field или common.")
+        return
+    set_chat_setting(message.chat.id, chat_type=new_type)
+    await message.answer(f"✅ Тип чата: *{new_type}*\n\nНовая памятка — /help", parse_mode="Markdown")
+
+
+@dp.message(Command("confirm"))
+async def on_confirm_cmd(message: Message):
+    parts = message.text.split(maxsplit=1)
+    s = get_chat_settings(message.chat.id)
+    if len(parts) < 2:
+        await message.answer(
+            f"Сейчас режим подтверждения: *{s['confirm_mode']}*\n\n"
+            "Доступные:\n"
+            "• `/confirm trades` — кнопки только для USDT-сделок и арбитража _(по умолчанию)_\n"
+            "• `/confirm all` — кнопки для всего, включая кэш\n"
+            "• `/confirm big` — кнопки только для сделок от 100 000₽\n"
+            "• `/confirm off` — без кнопок, записывать сразу",
+            parse_mode="Markdown")
+        return
+    mode = parts[1].strip().lower()
+    if mode not in ("all", "trades", "big", "off"):
+        await message.answer("Режим должен быть all, trades, big или off.")
+        return
+    set_chat_setting(message.chat.id, confirm_mode=mode)
+    await message.answer(f"✅ Подтверждение: *{mode}*", parse_mode="Markdown")
 
 
 @dp.message(Command("balance"))
@@ -463,6 +743,13 @@ async def on_balance(message: Message):
     text = f"💰 *Касса:* {fmt_rub(s['ruble_balance'])}\n💵 *Кошелёк:* {fmt_usdt(s['usdt_balance'])}"
     if s["extra_rubles"]:
         text += f"\n♻️ *Лишние:* {fmt_rub(s['extra_rubles'])}"
+    # Сколько pending
+    with db() as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM transactions WHERE chat_id = ? AND status = 'pending'",
+            (message.chat.id,)).fetchone()["c"]
+    if pending:
+        text += f"\n⏳ Не подтверждено: *{pending}* (см. /pending)"
     await message.answer(text, parse_mode="Markdown")
 
 
@@ -471,7 +758,7 @@ async def on_stats(message: Message):
     r = get_avg_rates(message.chat.id)
     s = get_state(message.chat.id)
 
-    if not r["avg_sell"] and not r["avg_buy"]:
+    if not r["avg_sell"] and not r["avg_buy"] and not r["arb_profit_usdt"]:
         await message.answer("USDT-сделок ещё нет.")
         return
 
@@ -492,6 +779,9 @@ async def on_stats(message: Message):
         lines.append(f"   • Покупай НЕ дороже *{fmt_rate(r['avg_sell'])}*")
         lines.append(f"   • Продавай НЕ дешевле *{fmt_rate(r['avg_buy'])}*")
 
+    if r["arb_profit_usdt"]:
+        lines.append(f"\n🔄 Профит от арбитража: *+{fmt_usdt(r['arb_profit_usdt'])}*")
+
     lines.append(f"\n💰 Касса: {fmt_rub(s['ruble_balance'])}")
     lines.append(f"💵 Кошелёк: {fmt_usdt(s['usdt_balance'])}")
     await message.answer("\n".join(lines), parse_mode="Markdown")
@@ -501,7 +791,8 @@ async def on_stats(message: Message):
 async def on_history(message: Message):
     with db() as conn:
         rows = conn.execute(
-            "SELECT * FROM transactions WHERE chat_id = ? ORDER BY id DESC LIMIT 15",
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "ORDER BY id DESC LIMIT 15",
             (message.chat.id,)).fetchall()
     if not rows:
         await message.answer("Операций ещё нет.")
@@ -517,7 +808,8 @@ async def on_cashflow(message: Message):
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM transactions WHERE chat_id = ? "
-            "AND type IN ('cash_in', 'cash_out') ORDER BY id DESC LIMIT 20",
+            "AND type IN ('cash_in', 'cash_out') AND status = 'confirmed' "
+            "ORDER BY id DESC LIMIT 20",
             (message.chat.id,)).fetchall()
     if not rows:
         await message.answer("Кэш-движений ещё нет.")
@@ -532,13 +824,41 @@ async def on_cashflow(message: Message):
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
+@dp.message(Command("pending"))
+async def on_pending(message: Message):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'pending' "
+            "ORDER BY id",
+            (message.chat.id,)).fetchall()
+    if not rows:
+        await message.answer("Нет операций, ждущих подтверждения.")
+        return
+    lines = [f"⏳ *Ждут подтверждения ({len(rows)}):*\n"]
+    for r in rows:
+        lines.append(fmt_tx_short(r))
+    lines.append("\nИспользуй кнопки под нужным сообщением, или /pending_cancel чтобы удалить все.")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("pending_cancel"))
+async def on_pending_cancel(message: Message):
+    with db() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM transactions WHERE chat_id = ? AND status = 'pending'",
+            (message.chat.id,)).fetchone()["c"]
+        conn.execute(
+            "DELETE FROM transactions WHERE chat_id = ? AND status = 'pending'",
+            (message.chat.id,))
+    await message.answer(f"🗑 Удалил {n} неподтверждённых операций.")
+
+
 @dp.message(Command("find"))
 async def on_find(message: Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(
             "Использование: `/find <ID | имя | сумма>`\n\n"
-            "Примеры:\n"
             "`/find #142` — найти операцию по ID\n"
             "`/find Адахан` — все операции с этим контрагентом\n"
             "`/find 96000` — все операции на эту сумму",
@@ -546,7 +866,6 @@ async def on_find(message: Message):
         return
     query = parts[1].strip()
 
-    # Поиск по ID (глобальный, чтобы можно было сверять между чатами)
     id_match = re.match(r"^#?(\d+)$", query.replace(" ", ""))
     if id_match:
         tx_id = int(id_match.group(1))
@@ -556,18 +875,17 @@ async def on_find(message: Message):
             await message.answer(f"Операция #{tx_id:03d} не найдена.")
             return
         same_chat = row["chat_id"] == message.chat.id
-        note = "" if same_chat else f"\n_(операция из другого чата, ID={row['chat_id']})_"
+        note = "" if same_chat else f"\n_(из другого чата, ID={row['chat_id']})_"
         await message.answer(f"🔍 *Найдено:*\n\n{fmt_tx_short(row)}{note}", parse_mode="Markdown")
         return
 
-    # Поиск по сумме (внутри чата)
     try:
         amount = parse_number(query)
         if amount >= 100:
             with db() as conn:
                 rows = conn.execute(
                     "SELECT * FROM transactions WHERE chat_id = ? "
-                    "AND ABS(rubles - ?) < 0.5 ORDER BY id DESC LIMIT 15",
+                    "AND ABS(rubles - ?) < 0.5 AND status = 'confirmed' ORDER BY id DESC LIMIT 15",
                     (message.chat.id, amount)).fetchall()
             if rows:
                 out = [f"🔍 *Найдено {len(rows)} операций на {fmt_rub(amount)}:*\n"]
@@ -577,13 +895,13 @@ async def on_find(message: Message):
     except (ValueError, TypeError):
         pass
 
-    # Поиск по контрагенту (внутри чата, регистронезависимо)
     pattern = f"%{query.lower()}%"
     with db() as conn:
         rows = conn.execute(
-            "SELECT * FROM transactions WHERE chat_id = ? "
-            "AND pylower(counterparty) LIKE ? ORDER BY id DESC LIMIT 15",
-            (message.chat.id, pattern)).fetchall()
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND (pylower(counterparty) LIKE ? OR pylower(partner_in) LIKE ? OR pylower(partner_out) LIKE ?) "
+            "ORDER BY id DESC LIMIT 15",
+            (message.chat.id, pattern, pattern, pattern)).fetchall()
     if not rows:
         await message.answer(f"По запросу «{query}» ничего не нашёл.")
         return
@@ -597,23 +915,15 @@ async def on_undo(message: Message):
     chat_id = message.chat.id
     with db() as conn:
         row = conn.execute(
-            "SELECT * FROM transactions WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "ORDER BY id DESC LIMIT 1",
             (chat_id,)).fetchone()
         if not row:
             await message.answer("Отменять нечего.")
             return
         conn.execute("DELETE FROM transactions WHERE id = ?", (row["id"],))
 
-    t = row["type"]
-    if t == "sell":
-        update_state(chat_id, d_rubles=-row["rubles"], d_usdt=row["usdt"])
-    elif t == "buy":
-        update_state(chat_id, d_rubles=row["rubles"], d_usdt=-row["usdt"])
-    elif t == "cash_in":
-        update_state(chat_id, d_rubles=-row["rubles"])
-    elif t == "cash_out":
-        update_state(chat_id, d_rubles=row["rubles"])
-
+    reverse_balance(chat_id, row)
     await message.answer(f"↩️ Отменил {fmt_id(row['id'])}: `{row['raw_text']}`", parse_mode="Markdown")
 
 
@@ -667,10 +977,19 @@ async def on_extra(message: Message):
     await message.answer(f"♻️ Лишние: {fmt_rub(val)}")
 
 
+# ────────────────── ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ──────────────────
 @dp.message(F.text)
 async def on_text(message: Message):
     chat_id = message.chat.id
+    settings = get_chat_settings(chat_id)
 
+    # 1. Сначала пробуем распознать арбитраж
+    arb = parse_arbitrage_message(message.text)
+    if arb:
+        await handle_arbitrage(message, arb, settings)
+        return
+
+    # 2. Иначе — строка за строкой
     parsed_items = []
     for line in message.text.split("\n"):
         p = parse_message_line(line)
@@ -692,28 +1011,153 @@ async def on_text(message: Message):
                 parse_mode="Markdown")
         return
 
+    await handle_regular_ops(message, parsed_items, settings)
+
+
+async def handle_arbitrage(message: Message, arb: dict, settings: dict):
+    chat_id = message.chat.id
+    needs_confirm = should_confirm(arb, settings)
+    status = "pending" if needs_confirm else "confirmed"
+
+    # raw_text — оригинал сообщения для трассировки
+    raw = message.text.strip()
+    counterparty = f"{arb['partner_in']}→{arb['partner_out']}"
+
+    tid = save_tx(
+        chat_id, "arb", counterparty, arb["rub_amount"],
+        usdt=arb["profit"],
+        rate=0,
+        raw=raw,
+        status=status,
+        usdt_in=arb["usdt_in"],
+        usdt_out=arb["usdt_out"],
+        partner_in=arb["partner_in"],
+        partner_out=arb["partner_out"],
+    )
+
+    initial = get_state(chat_id)
+
+    lines = [
+        f"🔄 *Арбитраж* {fmt_id(tid)}{' ⏳' if needs_confirm else ''}",
+        "",
+        f"📥 От *{arb['partner_in']}*: +{fmt_usdt(arb['usdt_in'])} (по курсу {fmt_rate(arb['rate_in'])})",
+        f"📤 К *{arb['partner_out']}*: −{fmt_usdt(arb['usdt_out'])} (по курсу {fmt_rate(arb['rate_out'])})",
+        f"💰 Через касу: {fmt_rub(arb['rub_amount'])} _(не зачисляется)_",
+        "",
+        f"💵 *Профит: +{fmt_usdt(arb['profit'])}*",
+    ]
+
+    if needs_confirm:
+        lines.append("\n⚠️ Проверь и подтверди:")
+        await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=confirm_kb(tid))
+    else:
+        apply_balance(chat_id, {
+            "type": "arb",
+            "usdt": arb["profit"],
+            "rubles": 0,
+        })
+        final = get_state(chat_id)
+        lines.append(f"\n💵 Кошелёк: {fmt_usdt(initial['usdt_balance'])} +{fmt_usdt(arb['profit'])} = *{fmt_usdt(final['usdt_balance'])}*")
+        await message.reply("\n".join(lines), parse_mode="Markdown")
+
+
+async def handle_regular_ops(message: Message, parsed_items: list, settings: dict):
+    chat_id = message.chat.id
+
+    # Решаем, есть ли среди операций такие, что требуют подтверждения
+    needs_confirm_items = [p for p, _ in parsed_items if should_confirm(p, settings)]
+    immediate_items = [(p, raw) for p, raw in parsed_items if not should_confirm(p, settings)]
+
+    # ВАРИАНТ 1: смешанный режим (часть нужна подтверждения, часть — нет)
+    # Чтобы не запутать пользователя — всё подтверждать вместе, если хоть одна нужна.
+    if needs_confirm_items:
+        # Сохраняем ВСЕ как pending, общий batch_id = id первой
+        saved = []
+        first_id = None
+        for p, raw in parsed_items:
+            t = p["type"]
+            cp = p["counterparty"]
+            if t in ("sell", "buy"):
+                tid = save_tx(chat_id, t, cp, p["rubles"], usdt=p["usdt"], rate=p["rate"],
+                              raw=raw, doer=p.get("doer"), status="pending")
+            else:
+                tid = save_tx(chat_id, t, cp, p["amount"],
+                              raw=raw, doer=p.get("doer"), status="pending")
+            if first_id is None:
+                first_id = tid
+            saved.append((tid, p))
+
+        # Привязываем все к batch_id первой операции
+        with db() as conn:
+            ids = [s[0] for s in saved]
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE transactions SET batch_id = ? WHERE id IN ({placeholders})",
+                (first_id, *ids))
+
+        # Сборка превью
+        if len(saved) == 1:
+            tid, p = saved[0]
+            t = p["type"]
+            if t in ("sell", "buy"):
+                verb = "Продал" if t == "sell" else "Купил у"
+                doer_str = f" ({p['doer']})" if p.get("doer") else ""
+                reply = [
+                    f"{fmt_id(tid)} ⏳ {verb} *{p['counterparty']}*{doer_str}",
+                    f"   {fmt_usdt(p['usdt'])} × {fmt_rate(p['rate'])} = {fmt_rub(p['rubles'])}",
+                    "",
+                    "⚠️ *Проверь и подтверди:*",
+                ]
+                if t == "sell":
+                    reply.append(f"📥 Ты получил {fmt_rub(p['rubles'])}?")
+                    reply.append(f"📤 Ты отправил {fmt_usdt(p['usdt'])}?")
+                else:
+                    reply.append(f"📥 Ты получил {fmt_usdt(p['usdt'])}?")
+                    reply.append(f"📤 Ты отправил {fmt_rub(p['rubles'])}?")
+                await message.reply("\n".join(reply), parse_mode="Markdown",
+                                    reply_markup=confirm_kb(first_id))
+            else:
+                sign = "+" if t == "cash_in" else "−"
+                verb = "Принял" if t == "cash_in" else "Выдал"
+                doer_str = f" ({p['doer']})" if p.get("doer") else ""
+                reply = [
+                    f"{fmt_id(tid)} ⏳ {verb} *{p['counterparty']}*{doer_str}",
+                    f"   {sign}{fmt_rub(p['amount'])}",
+                    "",
+                    "⚠️ *Подтверди:*",
+                ]
+                await message.reply("\n".join(reply), parse_mode="Markdown",
+                                    reply_markup=confirm_kb(first_id))
+        else:
+            lines = [f"⏳ *Распарсил {len(saved)} операций — подтверди все:*\n"]
+            for tid, p in saved:
+                t = p["type"]
+                if t == "sell":
+                    lines.append(f"{fmt_id(tid)} 📤 Продал {p['counterparty']}: +{fmt_rub(p['rubles'])} / −{fmt_usdt(p['usdt'])}")
+                elif t == "buy":
+                    lines.append(f"{fmt_id(tid)} 📥 Купил у {p['counterparty']}: −{fmt_rub(p['rubles'])} / +{fmt_usdt(p['usdt'])}")
+                elif t == "cash_in":
+                    lines.append(f"{fmt_id(tid)} 💰 Принял {p['counterparty']}: +{fmt_rub(p['amount'])}")
+                elif t == "cash_out":
+                    lines.append(f"{fmt_id(tid)} 💸 Выдал {p['counterparty']}: −{fmt_rub(p['amount'])}")
+            await message.reply("\n".join(lines), parse_mode="Markdown",
+                                reply_markup=confirm_kb(first_id))
+        return
+
+    # ВАРИАНТ 2: ничего не требует подтверждения — сразу записываем
     initial = get_state(chat_id)
     saved = []
     for p, raw in parsed_items:
         t = p["type"]
-        if t == "sell":
-            tid = save_tx(chat_id, "sell", p["counterparty"], p["rubles"],
-                          usdt=p["usdt"], rate=p["rate"], raw=raw, doer=p.get("doer"))
-            update_state(chat_id, d_rubles=p["rubles"], d_usdt=-p["usdt"])
-        elif t == "buy":
-            tid = save_tx(chat_id, "buy", p["counterparty"], p["rubles"],
-                          usdt=p["usdt"], rate=p["rate"], raw=raw, doer=p.get("doer"))
-            update_state(chat_id, d_rubles=-p["rubles"], d_usdt=p["usdt"])
-        elif t == "cash_in":
-            tid = save_tx(chat_id, "cash_in", p["counterparty"], p["amount"],
-                          raw=raw, doer=p.get("doer"))
-            update_state(chat_id, d_rubles=p["amount"])
-        elif t == "cash_out":
-            tid = save_tx(chat_id, "cash_out", p["counterparty"], p["amount"],
-                          raw=raw, doer=p.get("doer"))
-            update_state(chat_id, d_rubles=-p["amount"])
+        cp = p["counterparty"]
+        if t in ("sell", "buy"):
+            tid = save_tx(chat_id, t, cp, p["rubles"], usdt=p["usdt"], rate=p["rate"],
+                          raw=raw, doer=p.get("doer"), status="confirmed")
+            apply_balance(chat_id, {"type": t, "usdt": p["usdt"], "rubles": p["rubles"]})
         else:
-            continue
+            tid = save_tx(chat_id, t, cp, p["amount"],
+                          raw=raw, doer=p.get("doer"), status="confirmed")
+            apply_balance(chat_id, {"type": t, "usdt": 0, "rubles": p["amount"]})
         saved.append((tid, p))
 
     final = get_state(chat_id)
@@ -725,41 +1169,23 @@ async def on_text(message: Message):
             verb = "Продал" if t == "sell" else "Купил у"
             op_sign = "+" if t == "sell" else "−"
             doer_str = f" ({p['doer']})" if p.get("doer") else ""
-            reply = [
-                f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}",
-                f"   {fmt_usdt(p['usdt'])} × {fmt_rate(p['rate'])} = {fmt_rub(p['rubles'])}",
-                "",
-                f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['rubles'])} = *{fmt_rub(final['ruble_balance'])}*",
+            await message.reply(
+                f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}\n"
+                f"   {fmt_usdt(p['usdt'])} × {fmt_rate(p['rate'])} = {fmt_rub(p['rubles'])}\n\n"
+                f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['rubles'])} = *{fmt_rub(final['ruble_balance'])}*\n"
                 f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*",
-            ]
-            avgs = get_avg_rates(chat_id)
-            if t == "buy" and avgs["avg_sell"]:
-                if p["rate"] >= avgs["avg_sell"]:
-                    reply.append(f"\n⚠️ Курс {fmt_rate(p['rate'])} ≥ средн. продажи {fmt_rate(avgs['avg_sell'])} — это минус!")
-                else:
-                    margin = avgs["avg_sell"] - p["rate"]
-                    reply.append(f"\n👍 Ниже средн. продажи на {margin:.2f}₽. Профит ≈ *{fmt_rub(margin * p['usdt'])}*")
-            elif t == "sell" and avgs["avg_buy"]:
-                if p["rate"] <= avgs["avg_buy"]:
-                    reply.append(f"\n⚠️ Курс {fmt_rate(p['rate'])} ≤ средн. покупки {fmt_rate(avgs['avg_buy'])} — это минус!")
-                else:
-                    margin = p["rate"] - avgs["avg_buy"]
-                    reply.append(f"\n👍 Выше средн. покупки на {margin:.2f}₽. Профит ≈ *{fmt_rub(margin * p['usdt'])}*")
-            await message.reply("\n".join(reply), parse_mode="Markdown")
+                parse_mode="Markdown")
         else:
             sign = "+" if t == "cash_in" else "−"
             verb = "Принял" if t == "cash_in" else "Выдал"
             doer_str = f" ({p['doer']})" if p.get("doer") else ""
             op_sign = "+" if t == "cash_in" else "−"
-            reply = [
-                f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}",
-                f"   {sign}{fmt_rub(p['amount'])}",
-                "",
+            await message.reply(
+                f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}\n"
+                f"   {sign}{fmt_rub(p['amount'])}\n\n"
                 f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['amount'])} = *{fmt_rub(final['ruble_balance'])}*",
-            ]
-            await message.reply("\n".join(reply), parse_mode="Markdown")
+                parse_mode="Markdown")
     else:
-        # Несколько операций в одном сообщении
         lines = [f"✅ *Записано {len(saved)} операций:*\n"]
         d_rub = 0.0
         d_usdt = 0.0
@@ -784,6 +1210,101 @@ async def on_text(message: Message):
         if abs(d_usdt) > 1e-6:
             lines.append(f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*")
         await message.reply("\n".join(lines), parse_mode="Markdown")
+
+
+# ────────────────── ОБРАБОТЧИКИ КНОПОК ──────────────────
+@dp.callback_query(F.data.startswith("c:"))
+async def on_confirm_button(cq: CallbackQuery):
+    try:
+        batch_id = int(cq.data[2:])
+    except ValueError:
+        await cq.answer("Ошибка кнопки.", show_alert=True)
+        return
+
+    chat_id = cq.message.chat.id
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND batch_id = ? AND status = 'pending'",
+            (chat_id, batch_id)).fetchall()
+        # Если batch_id не выставлен (одиночная операция), пробуем по id
+        if not rows:
+            rows = conn.execute(
+                "SELECT * FROM transactions WHERE chat_id = ? AND id = ? AND status = 'pending'",
+                (chat_id, batch_id)).fetchall()
+        if not rows:
+            await cq.answer("Уже подтверждено или отменено.", show_alert=True)
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        # Подтверждаем все
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE transactions SET status = 'confirmed' WHERE id IN ({placeholders})",
+            ids)
+
+    # Применяем балансы
+    for r in rows:
+        apply_balance(chat_id, r)
+
+    final = get_state(chat_id)
+    n = len(rows)
+    if n == 1:
+        r = rows[0]
+        confirm_line = f"\n\n✅ *Подтверждено* в {datetime.utcnow().strftime('%H:%M UTC')}"
+    else:
+        confirm_line = f"\n\n✅ *Подтверждено {n} операций* в {datetime.utcnow().strftime('%H:%M UTC')}"
+    confirm_line += f"\n💰 Касса: *{fmt_rub(final['ruble_balance'])}*"
+    confirm_line += f"\n💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
+
+    try:
+        new_text = (cq.message.text or "") + confirm_line
+        await cq.message.edit_text(new_text, parse_mode="Markdown", reply_markup=None)
+    except Exception as e:
+        log.warning(f"edit_text failed: {e}")
+        await cq.message.answer(f"✅ Подтверждено {n} операций.{confirm_line}", parse_mode="Markdown")
+    await cq.answer("Записано!")
+
+
+@dp.callback_query(F.data.startswith("x:"))
+async def on_cancel_button(cq: CallbackQuery):
+    try:
+        batch_id = int(cq.data[2:])
+    except ValueError:
+        await cq.answer("Ошибка кнопки.", show_alert=True)
+        return
+
+    chat_id = cq.message.chat.id
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND batch_id = ? AND status = 'pending'",
+            (chat_id, batch_id)).fetchall()
+        if not rows:
+            rows = conn.execute(
+                "SELECT * FROM transactions WHERE chat_id = ? AND id = ? AND status = 'pending'",
+                (chat_id, batch_id)).fetchall()
+        if not rows:
+            await cq.answer("Уже подтверждено или отменено.", show_alert=True)
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM transactions WHERE id IN ({placeholders})", ids)
+
+    n = len(rows)
+    try:
+        new_text = (cq.message.text or "") + f"\n\n❌ *Отменено* ({n} оп.)"
+        await cq.message.edit_text(new_text, parse_mode="Markdown", reply_markup=None)
+    except Exception:
+        await cq.message.answer(f"❌ Отменено {n} операций.", parse_mode="Markdown")
+    await cq.answer("Отменено")
 
 
 # ────────────────── ЗАПУСК ──────────────────
