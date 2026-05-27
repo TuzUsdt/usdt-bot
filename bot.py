@@ -162,6 +162,12 @@ def init_db():
             conn.execute("PRAGMA user_version = 3")
             log.info("Применил миграцию v3 (status, batch_id, поля арбитража).")
 
+        # v4: типы долгов добавлены в код (loan_out, loan_in, debt_repay_in, debt_repay_out),
+        # отдельной схемы не нужно — используется та же transactions с новыми type.
+        if version < 4:
+            conn.execute("PRAGMA user_version = 4")
+            log.info("Применил миграцию v4 (типы долгов).")
+
         # Настройки чата (тип, режим подтверждения)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS chat_settings (
@@ -251,6 +257,111 @@ def get_avg_rates(chat_id: int) -> dict:
         "total_spent":       buy["r"],
         "arb_profit_usdt":   arb_profit["p"],
     }
+
+
+# ───── Долги ─────
+def name_root(name: str) -> str:
+    """
+    Возвращает нормализованный «корень» имени для группировки долгов.
+    Русские имена меняются по падежам («Михаил» → «Михаилу» → «Михаила»),
+    бот считал бы их разными людьми. Решение — брать первые 3 буквы.
+
+    Стратегия:
+      • Латиница / цифры — возвращаем как есть в lowercase (MTX, Mtex).
+      • Русское слово — первые 3 буквы в lowercase.
+        («Михаил» / «Михаила» / «Михаилу» → "мих";
+         «Вася»   / «Васи»    / «Васе»    → "вас";
+         «Анна»   / «Анной»   / «Анне»    → "анн";
+         «Юра»    / «Юры»     / «Юре»     → "юра".)
+
+    Компромисс: разные имена с одинаковыми первыми 3 буквами схлопнутся
+    («Михаил» и «Михей» оба → «мих», «Иван» и «Ивановский» оба → «ива»).
+    Если такое случается на практике — увидишь в /debts и переименуешь одного
+    контрагента, например на «Михей-Москва» — корень станет другим.
+    """
+    if not name:
+        return ""
+    first_word = re.split(r"[\s\(\),]+", name.strip())[0]
+    if not first_word:
+        return ""
+    lower = first_word.lower()
+
+    # Латиница/смешанное — не трогаем
+    if not any("а" <= ch <= "я" or ch == "ё" for ch in lower):
+        return lower
+
+    # Русское — первые 3 буквы (или всё слово если оно короче)
+    return lower[:3]
+
+
+def get_debts(chat_id: int) -> dict:
+    """
+    Считает открытые долги по этому чату.
+    Имена группируются через name_root, чтобы «Михаил» и «Михаилу» считались
+    одним человеком.
+
+    Возвращает {
+        "owed_to_us": [(name, amount), ...],
+        "we_owe":     [(name, amount), ...],
+        "total_owed_to_us": float,
+        "total_we_owe": float,
+    }
+    """
+    with db() as conn:
+        # Все долговые транзакции
+        all_loan_rows = conn.execute(
+            "SELECT id, type, counterparty, rubles FROM transactions "
+            "WHERE chat_id = ? AND status = 'confirmed' "
+            "AND type IN ('loan_out', 'loan_in', 'debt_repay_in', 'debt_repay_out') "
+            "ORDER BY id",
+            (chat_id,)).fetchall()
+
+    # Агрегируем по name_root
+    owed_acc = {}  # root → {"bal": float, "display_name": str}
+    we_owe_acc = {}
+    for r in all_loan_rows:
+        cp = r["counterparty"] or "—"
+        root = name_root(cp)
+        if r["type"] == "loan_out":
+            d = owed_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
+            d["bal"] += r["rubles"]; d["display_name"] = cp
+        elif r["type"] == "debt_repay_in":
+            d = owed_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
+            d["bal"] -= r["rubles"]
+        elif r["type"] == "loan_in":
+            d = we_owe_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
+            d["bal"] += r["rubles"]; d["display_name"] = cp
+        elif r["type"] == "debt_repay_out":
+            d = we_owe_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
+            d["bal"] -= r["rubles"]
+
+    owed_to_us = [(v["display_name"], round(v["bal"], 2))
+                  for v in owed_acc.values() if v["bal"] > 0.01]
+    we_owe = [(v["display_name"], round(v["bal"], 2))
+              for v in we_owe_acc.values() if v["bal"] > 0.01]
+
+    owed_to_us.sort(key=lambda x: -x[1])
+    we_owe.sort(key=lambda x: -x[1])
+
+    return {
+        "owed_to_us":         owed_to_us,
+        "we_owe":             we_owe,
+        "total_owed_to_us":   sum(a for _, a in owed_to_us),
+        "total_we_owe":       sum(a for _, a in we_owe),
+    }
+
+
+def get_debt_history(chat_id: int, name: str) -> list:
+    """История долговых операций по корню имени (регистронезависимо, через падежи)."""
+    target_root = name_root(name)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND type IN ('loan_out', 'loan_in', 'debt_repay_in', 'debt_repay_out') "
+            "ORDER BY id",
+            (chat_id,)).fetchall()
+    # Фильтруем по корню
+    return [r for r in rows if name_root(r["counterparty"] or "") == target_root]
 
 
 # ────────────────── ПАРСИНГ ──────────────────
@@ -435,8 +546,82 @@ def parse_cash_flow(text: str):
     return {"type": direction, "doer": doer, "counterparty": target, "amount": amount}
 
 
+def parse_loan(text: str):
+    """
+    Долговые операции. Возвращает dict или None.
+
+    Шаблоны:
+      Дал в долг Михаилу 90000        → loan_out  (касса -, должник Михаил +)
+      Занял у Васи 200000             → loan_in   (касса +, кредитор Вася +)
+      Михаил вернул 50000             → debt_repay_in  (касса +, долг Михаила -)
+      Вернул Васе 100000              → debt_repay_out (касса -, наш долг Васе -)
+    """
+    t = text.strip().lstrip("+-—– ").strip()
+    lower = t.lower()
+
+    # Дал в долг X сумма
+    m = re.match(
+        r"^(?:дал|дала|дали|выдал|выдала|выдали|занял\s+(?!у\b))\s+в\s+долг\s+(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
+        t, re.IGNORECASE)
+    if m:
+        try:
+            amt = parse_number(m.group(2))
+        except ValueError:
+            return None
+        if amt <= 0:
+            return None
+        return {"type": "loan_out", "counterparty": m.group(1).strip(),
+                "amount": amt, "doer": None}
+
+    # Занял у X сумма (без "в долг")
+    m = re.match(
+        r"^(?:занял|заняла|заняли|взял\s+в\s+долг|взяли\s+в\s+долг)\s+(?:у\s+)?(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
+        t, re.IGNORECASE)
+    if m:
+        try:
+            amt = parse_number(m.group(2))
+        except ValueError:
+            return None
+        if amt <= 0:
+            return None
+        return {"type": "loan_in", "counterparty": m.group(1).strip(),
+                "amount": amt, "doer": None}
+
+    # X вернул [нам] сумма
+    m = re.match(
+        r"^(.+?)\s+(?:вернул|вернула|вернули|отдал|отдала|отдали|погасил|погасила|погасили)"
+        r"(?:\s+(?:нам|мне|долг))?\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
+        t, re.IGNORECASE)
+    if m:
+        try:
+            amt = parse_number(m.group(2))
+        except ValueError:
+            return None
+        if amt <= 0:
+            return None
+        return {"type": "debt_repay_in", "counterparty": m.group(1).strip(),
+                "amount": amt, "doer": None}
+
+    # Вернул/Отдал X сумма (мы отдаём свой долг)
+    m = re.match(
+        r"^(?:вернул|вернула|вернули|отдал\s+долг|отдала\s+долг|отдали\s+долг|погасил|погасила|погасили)"
+        r"\s+(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
+        t, re.IGNORECASE)
+    if m:
+        try:
+            amt = parse_number(m.group(2))
+        except ValueError:
+            return None
+        if amt <= 0:
+            return None
+        return {"type": "debt_repay_out", "counterparty": m.group(1).strip(),
+                "amount": amt, "doer": None}
+
+    return None
+
+
 def parse_message_line(line: str):
-    """Парсит одну строку: сначала сделку, потом кэш-движение."""
+    """Парсит одну строку: сначала сделку, потом долг, потом кэш-движение."""
     line = line.strip()
     line = re.sub(r"^\d+\s*[\.\)]\s*", "", line).strip()
     if not line:
@@ -444,6 +629,9 @@ def parse_message_line(line: str):
     t = parse_trade(line)
     if t:
         return t
+    l = parse_loan(line)
+    if l:
+        return l
     c = parse_cash_flow(line)
     if c:
         return c
@@ -550,6 +738,45 @@ def fmt_id(i: int) -> str:
     return f"#{i:03d}"
 
 
+def format_debt_status(d: dict, focus_name: str = None, max_items: int = 4) -> str:
+    """
+    Возвращает строку-напоминание о долгах для добавления к ответу бота.
+    focus_name — если указан, выводит ТОЛЬКО детали по этому контрагенту.
+    Возвращает '' если долгов нет.
+    """
+    lines = []
+    if focus_name:
+        focus_lower = focus_name.lower()
+        # Ищем должника
+        for name, amt in d.get("owed_to_us", []):
+            if name.lower() == focus_lower or focus_lower in name.lower():
+                lines.append(f"   📥 *{name}* теперь должен нам *{fmt_rub(amt)}*")
+                break
+        for name, amt in d.get("we_owe", []):
+            if name.lower() == focus_lower or focus_lower in name.lower():
+                lines.append(f"   📤 *Мы должны {name}: {fmt_rub(amt)}*")
+                break
+        return "\n".join(lines) if lines else ""
+
+    # Общий вид (для напоминания после сделки)
+    owed = d.get("owed_to_us", [])
+    we_owe = d.get("we_owe", [])
+    if not owed and not we_owe:
+        return ""
+
+    if owed:
+        names = ", ".join(f"{n} {fmt_rub(a)}" for n, a in owed[:max_items])
+        if len(owed) > max_items:
+            names += f" + ещё {len(owed) - max_items}"
+        lines.append(f"⚠️ Нам должны *{fmt_rub(d['total_owed_to_us'])}*: {names}")
+    if we_owe:
+        names = ", ".join(f"{n} {fmt_rub(a)}" for n, a in we_owe[:max_items])
+        if len(we_owe) > max_items:
+            names += f" + ещё {len(we_owe) - max_items}"
+        lines.append(f"⚠️ Мы должны *{fmt_rub(d['total_we_owe'])}*: {names}")
+    return "\n" + "\n".join(lines)
+
+
 def fmt_tx_short(r) -> str:
     tid = fmt_id(r["id"])
     cp = r["counterparty"] or "—"
@@ -567,6 +794,14 @@ def fmt_tx_short(r) -> str:
         pin = r["partner_in"] if "partner_in" in r.keys() else "?"
         pout = r["partner_out"] if "partner_out" in r.keys() else "?"
         return f"{tid}{pending} 🔄 Арбитраж {pin}→{pout}: +{fmt_usdt(r['usdt'])} профит"
+    if t == "loan_out":
+        return f"{tid}{pending} 📤💳 Дал в долг {cp}: −{fmt_rub(r['rubles'])}"
+    if t == "loan_in":
+        return f"{tid}{pending} 📥💳 Занял у {cp}: +{fmt_rub(r['rubles'])}"
+    if t == "debt_repay_in":
+        return f"{tid}{pending} ↩️💰 {cp} вернул долг: +{fmt_rub(r['rubles'])}"
+    if t == "debt_repay_out":
+        return f"{tid}{pending} ↩️💸 Вернул {cp}: −{fmt_rub(r['rubles'])}"
     return f"{tid}{pending} {t}: {fmt_rub(r['rubles'])}"
 
 
@@ -585,6 +820,14 @@ def apply_balance(chat_id: int, tx_row) -> None:
     elif t == "arb":
         # Касса не меняется, в кошелёк падает только разница (profit, лежит в поле usdt)
         update_state(chat_id, d_usdt=tx_row["usdt"])
+    elif t == "loan_out":          # дали в долг → касса -
+        update_state(chat_id, d_rubles=-tx_row["rubles"])
+    elif t == "loan_in":           # заняли → касса +
+        update_state(chat_id, d_rubles=tx_row["rubles"])
+    elif t == "debt_repay_in":     # нам вернули → касса +
+        update_state(chat_id, d_rubles=tx_row["rubles"])
+    elif t == "debt_repay_out":    # мы вернули → касса -
+        update_state(chat_id, d_rubles=-tx_row["rubles"])
 
 
 def reverse_balance(chat_id: int, tx_row) -> None:
@@ -600,6 +843,14 @@ def reverse_balance(chat_id: int, tx_row) -> None:
         update_state(chat_id, d_rubles=tx_row["rubles"])
     elif t == "arb":
         update_state(chat_id, d_usdt=-tx_row["usdt"])
+    elif t == "loan_out":
+        update_state(chat_id, d_rubles=tx_row["rubles"])
+    elif t == "loan_in":
+        update_state(chat_id, d_rubles=-tx_row["rubles"])
+    elif t == "debt_repay_in":
+        update_state(chat_id, d_rubles=-tx_row["rubles"])
+    elif t == "debt_repay_out":
+        update_state(chat_id, d_rubles=tx_row["rubles"])
 
 
 def should_confirm(parsed: dict, settings: dict) -> bool:
@@ -611,6 +862,7 @@ def should_confirm(parsed: dict, settings: dict) -> bool:
         return True
     t = parsed["type"]
     if mode == "trades":
+        # Подтверждаем только сделки и арбитраж. Кэш и долги — сразу.
         return t in ("sell", "buy", "arb")
     if mode == "big":
         amt = parsed.get("rubles") or parsed.get("amount") or parsed.get("rub_amount") or 0
@@ -624,7 +876,7 @@ dp = Dispatcher()
 
 
 HELP_MAIN = (
-    "👋 Я веду учёт USDT-сделок, кэш-движений и арбитража.\n"
+    "👋 Я веду учёт USDT-сделок, кэш-движений, долгов и арбитража.\n"
     "_Тип чата:_ *main* (твой личный — пишешь все операции)\n\n"
     "📝 *USDT-сделки* (меняют ₽ и USDT, требуют подтверждения):\n"
     "`Продал Гиге 475600/76.262`\n"
@@ -635,13 +887,18 @@ HELP_MAIN = (
     "`Выдал Владу 72 600`\n"
     "`Принял от Адахана 729 100`\n"
     "`+ 96000 от клиента`\n\n"
+    "💳 *Долги:*\n"
+    "`Дал в долг Михаилу 90000`\n"
+    "`Занял у Васи 200000`\n"
+    "`Михаил вернул 50000`\n"
+    "`Вернул Васе 100000`\n\n"
     "🔄 *Арбитраж* (касса не меняется, в кошелёк падает спред):\n"
     "```\nСделка без моих средств\n"
     "Купил у Германа 196500/75=2620\n"
     "Продал Стефу 196500/75.5=2602\n```\n"
     "📊 *Команды:*\n"
-    "/balance · /stats · /history · /cashflow · /find\n"
-    "/undo · /pending · /setcash · /settype · /confirm · /help"
+    "/balance · /stats · /history · /cashflow · /debts · /debt\n"
+    "/find · /undo · /pending · /setcash · /settype · /confirm · /help"
 )
 
 HELP_FIELD = (
@@ -654,8 +911,11 @@ HELP_FIELD = (
     "`Выдали Владу 72 600` _(из общей кассы → на руки Владу)_\n"
     "`Принял от клиента 96 000` _(клиент дал нал)_\n"
     "`Влад выдал клиенту 30 000`\n\n"
+    "💳 *Долги клиентов:*\n"
+    "`Дал в долг Серёге 50000`\n"
+    "`Серёга вернул 50000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /history · /cashflow · /find · /undo · /pending · /settype · /help"
+    "/balance · /history · /cashflow · /debts · /find · /undo · /pending · /settype · /help"
 )
 
 HELP_COMMON = (
@@ -666,8 +926,11 @@ HELP_COMMON = (
     "`Принял от Ивана 800 000` _(Иван внёс в кассу)_\n"
     "`Выдал Владу 100 000` _(касса → Владу на оборотку)_\n"
     "`Выдал на расходы 30 000`\n\n"
+    "💳 *Долги партнёров:*\n"
+    "`Дал в долг MTX 1 000 000`\n"
+    "`MTX вернул 500 000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /cashflow · /find · /undo · /history · /settype · /help"
+    "/balance · /cashflow · /debts · /find · /undo · /history · /settype · /help"
 )
 
 
@@ -821,6 +1084,89 @@ async def on_cashflow(message: Message):
         lines.append(f"{fmt_id(r['id'])} {sign}{fmt_rub(r['rubles'])} — {cp}")
     s = get_state(message.chat.id)
     lines.append(f"\n💰 Текущая касса: *{fmt_rub(s['ruble_balance'])}*")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("debts"))
+async def on_debts(message: Message):
+    d = get_debts(message.chat.id)
+    lines = ["💳 *Долги*\n"]
+
+    if d["owed_to_us"]:
+        lines.append(f"📥 *Нам должны:* {fmt_rub(d['total_owed_to_us'])}")
+        for name, amt in d["owed_to_us"]:
+            lines.append(f"   • {name}: {fmt_rub(amt)}")
+    else:
+        lines.append("📥 *Нам никто не должен.*")
+
+    lines.append("")
+
+    if d["we_owe"]:
+        lines.append(f"📤 *Мы должны:* {fmt_rub(d['total_we_owe'])}")
+        for name, amt in d["we_owe"]:
+            lines.append(f"   • {name}: {fmt_rub(amt)}")
+    else:
+        lines.append("📤 *Мы никому не должны.*")
+
+    net = d["total_owed_to_us"] - d["total_we_owe"]
+    lines.append("")
+    if net > 0:
+        lines.append(f"📊 *Чистый баланс: +{fmt_rub(net)}* (нам должны больше, чем мы)")
+    elif net < 0:
+        lines.append(f"📊 *Чистый баланс: −{fmt_rub(abs(net))}* (мы должны больше, чем нам)")
+    else:
+        lines.append("📊 *Чистый баланс: 0*")
+
+    lines.append("\nДеталь по человеку: `/debt <имя>`")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("debt"))
+async def on_debt(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: `/debt <имя>`\n"
+            "Например: `/debt Михаил`",
+            parse_mode="Markdown")
+        return
+    name = parts[1].strip()
+    rows = get_debt_history(message.chat.id, name)
+    if not rows:
+        await message.answer(f"Долговых операций по «{name}» не нашёл.")
+        return
+
+    # Считаем остаток: для loan_out / debt_repay_in — нам должны
+    # для loan_in / debt_repay_out — мы должны
+    bal_owed = 0.0  # нам должны
+    bal_owe = 0.0   # мы должны
+    for r in rows:
+        if r["type"] == "loan_out":
+            bal_owed += r["rubles"]
+        elif r["type"] == "debt_repay_in":
+            bal_owed -= r["rubles"]
+        elif r["type"] == "loan_in":
+            bal_owe += r["rubles"]
+        elif r["type"] == "debt_repay_out":
+            bal_owe -= r["rubles"]
+
+    lines = [f"💳 *История долгов по «{name}»* ({len(rows)} оп.)\n"]
+    for r in rows:
+        lines.append(fmt_tx_short(r))
+    lines.append("")
+    if abs(bal_owed) > 0.01:
+        if bal_owed > 0:
+            lines.append(f"📥 *Остаток: должен нам {fmt_rub(bal_owed)}*")
+        else:
+            lines.append(f"⚠️ Переплата: нам вернули на {fmt_rub(-bal_owed)} больше")
+    if abs(bal_owe) > 0.01:
+        if bal_owe > 0:
+            lines.append(f"📤 *Остаток: мы должны {fmt_rub(bal_owe)}*")
+        else:
+            lines.append(f"⚠️ Переплата: мы вернули на {fmt_rub(-bal_owe)} больше")
+    if abs(bal_owed) < 0.01 and abs(bal_owe) < 0.01:
+        lines.append("✅ Расчёты закрыты.")
+
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1000,7 +1346,9 @@ async def on_text(message: Message):
         low = message.text.lower().strip()
         triggers = ("продал", "продала", "купил", "купила", "откупил",
                     "выдал", "выдала", "выдали", "отдал", "отдали",
-                    "принял", "приняла", "приняли", "забрал", "забрали")
+                    "принял", "приняла", "приняли", "забрал", "забрали",
+                    "занял", "заняла", "заняли", "долг", "вернул",
+                    "вернула", "вернули", "погасил", "погасили")
         if any(t in low for t in triggers):
             await message.reply(
                 "Не понял формат. Примеры:\n"
@@ -1058,6 +1406,9 @@ async def handle_arbitrage(message: Message, arb: dict, settings: dict):
         })
         final = get_state(chat_id)
         lines.append(f"\n💵 Кошелёк: {fmt_usdt(initial['usdt_balance'])} +{fmt_usdt(arb['profit'])} = *{fmt_usdt(final['usdt_balance'])}*")
+        debt_status = format_debt_status(get_debts(chat_id))
+        if debt_status:
+            lines.append(debt_status)
         await message.reply("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1169,26 +1520,57 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
             verb = "Продал" if t == "sell" else "Купил у"
             op_sign = "+" if t == "sell" else "−"
             doer_str = f" ({p['doer']})" if p.get("doer") else ""
+            d = get_debts(chat_id)
+            debt_reminder = format_debt_status(d)
             await message.reply(
                 f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}\n"
                 f"   {fmt_usdt(p['usdt'])} × {fmt_rate(p['rate'])} = {fmt_rub(p['rubles'])}\n\n"
                 f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['rubles'])} = *{fmt_rub(final['ruble_balance'])}*\n"
-                f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*",
+                f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
+                f"{debt_reminder}",
                 parse_mode="Markdown")
         else:
-            sign = "+" if t == "cash_in" else "−"
-            verb = "Принял" if t == "cash_in" else "Выдал"
             doer_str = f" ({p['doer']})" if p.get("doer") else ""
-            op_sign = "+" if t == "cash_in" else "−"
-            await message.reply(
-                f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}\n"
-                f"   {sign}{fmt_rub(p['amount'])}\n\n"
+            if t == "loan_out":
+                verb_full = f"Дал в долг *{p['counterparty']}*{doer_str}"
+                op_sign = "−"
+                sign = "−"
+            elif t == "loan_in":
+                verb_full = f"Занял у *{p['counterparty']}*{doer_str}"
+                op_sign = "+"
+                sign = "+"
+            elif t == "debt_repay_in":
+                verb_full = f"*{p['counterparty']}*{doer_str} вернул долг"
+                op_sign = "+"
+                sign = "+"
+            elif t == "debt_repay_out":
+                verb_full = f"Вернул долг *{p['counterparty']}*{doer_str}"
+                op_sign = "−"
+                sign = "−"
+            else:
+                verb = "Принял" if t == "cash_in" else "Выдал"
+                verb_full = f"{verb} *{p['counterparty']}*{doer_str}"
+                op_sign = "+" if t == "cash_in" else "−"
+                sign = op_sign
+
+            reply_lines = [
+                f"{fmt_id(tid)} ✅ {verb_full}",
+                f"   {sign}{fmt_rub(p['amount'])}",
+                "",
                 f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['amount'])} = *{fmt_rub(final['ruble_balance'])}*",
-                parse_mode="Markdown")
+            ]
+            # Для долговых операций — показываем актуальное состояние долгов
+            if t in ("loan_out", "loan_in", "debt_repay_in", "debt_repay_out"):
+                d = get_debts(chat_id)
+                debt_line = format_debt_status(d, focus_name=p["counterparty"])
+                if debt_line:
+                    reply_lines.append(debt_line)
+            await message.reply("\n".join(reply_lines), parse_mode="Markdown")
     else:
         lines = [f"✅ *Записано {len(saved)} операций:*\n"]
         d_rub = 0.0
         d_usdt = 0.0
+        has_debt_ops = False
         for tid, p in saved:
             t = p["type"]
             if t == "sell":
@@ -1203,12 +1585,28 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
             elif t == "cash_out":
                 lines.append(f"{fmt_id(tid)} 💸 Выдал {p['counterparty']}: −{fmt_rub(p['amount'])}")
                 d_rub -= p["amount"]
+            elif t == "loan_out":
+                lines.append(f"{fmt_id(tid)} 📤💳 Дал в долг {p['counterparty']}: −{fmt_rub(p['amount'])}")
+                d_rub -= p["amount"]; has_debt_ops = True
+            elif t == "loan_in":
+                lines.append(f"{fmt_id(tid)} 📥💳 Занял у {p['counterparty']}: +{fmt_rub(p['amount'])}")
+                d_rub += p["amount"]; has_debt_ops = True
+            elif t == "debt_repay_in":
+                lines.append(f"{fmt_id(tid)} ↩️💰 {p['counterparty']} вернул: +{fmt_rub(p['amount'])}")
+                d_rub += p["amount"]; has_debt_ops = True
+            elif t == "debt_repay_out":
+                lines.append(f"{fmt_id(tid)} ↩️💸 Вернул {p['counterparty']}: −{fmt_rub(p['amount'])}")
+                d_rub -= p["amount"]; has_debt_ops = True
         lines.append(f"\n📊 Итого по ₽: {('+' if d_rub >= 0 else '−')}{fmt_rub(abs(d_rub))}")
         if abs(d_usdt) > 1e-6:
             lines.append(f"📊 Итого по USDT: {('+' if d_usdt >= 0 else '−')}{fmt_usdt(abs(d_usdt))}")
         lines.append(f"\n💰 Касса: {fmt_rub(initial['ruble_balance'])} → *{fmt_rub(final['ruble_balance'])}*")
         if abs(d_usdt) > 1e-6:
             lines.append(f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*")
+        if has_debt_ops:
+            debt_status = format_debt_status(get_debts(chat_id))
+            if debt_status:
+                lines.append(debt_status)
         await message.reply("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1259,6 +1657,9 @@ async def on_confirm_button(cq: CallbackQuery):
         confirm_line = f"\n\n✅ *Подтверждено {n} операций* в {datetime.utcnow().strftime('%H:%M UTC')}"
     confirm_line += f"\n💰 Касса: *{fmt_rub(final['ruble_balance'])}*"
     confirm_line += f"\n💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
+    debt_status = format_debt_status(get_debts(chat_id))
+    if debt_status:
+        confirm_line += debt_status
 
     try:
         new_text = (cq.message.text or "") + confirm_line
