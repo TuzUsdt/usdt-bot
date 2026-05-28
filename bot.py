@@ -48,12 +48,25 @@ except ImportError:
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 )
 
 # ────────────────── НАСТРОЙКИ ──────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = Path(__file__).parent / "trades.db"
+
+# Где хранить базу. Если задана переменная окружения DATA_DIR (на Railway —
+# точка монтирования Volume, например /data), база живёт там и НЕ стирается
+# при передеплоях. Если переменной нет — база лежит рядом с bot.py (как раньше).
+_data_dir = os.getenv("DATA_DIR", "").strip()
+if _data_dir:
+    DATA_DIR = Path(_data_dir)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        DATA_DIR = Path(__file__).parent
+else:
+    DATA_DIR = Path(__file__).parent
+DB_PATH = DATA_DIR / "trades.db"
 
 # Часовой пояс пользователя для отчётов (Красноярск = UTC+7).
 # Можно переопределить переменной окружения TZ_OFFSET (в часах).
@@ -791,6 +804,203 @@ def format_period_report(agg: dict) -> str:
     return "\n".join(lines)
 
 
+# ───── Экспорт в Excel ─────
+TYPE_LABELS = {
+    "sell": "Продажа USDT",
+    "buy": "Покупка USDT",
+    "cash_in": "Приход кэш",
+    "cash_out": "Расход кэш",
+    "arb": "Арбитраж",
+    "loan_out": "Дал в долг",
+    "loan_in": "Занял",
+    "debt_repay_in": "Вернули нам долг",
+    "debt_repay_out": "Вернули мы долг",
+}
+
+
+def _ts_to_local_str(ts: str) -> str:
+    """ISO-строку UTC → локальное время пользователя 'ДД.ММ.ГГГГ ЧЧ:ММ'."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).strftime("%d.%m.%Y %H:%M")
+    except (ValueError, TypeError):
+        return ts
+
+
+def build_excel_export(chat_id: int, period: str = None) -> str:
+    """
+    Строит .xlsx со всеми операциями (+ клиенты, долги, сводка) и возвращает путь.
+    period: None = всё, иначе 'day'/'week'/'month' — фильтр операций по периоду.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    # Выбираем операции
+    if period:
+        start_iso, end_iso, ptitle = _period_bounds(period)
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM transactions WHERE chat_id = ? AND ts >= ? AND ts <= ? "
+                "ORDER BY id", (chat_id, start_iso, end_iso)).fetchall()
+        title_suffix = ptitle
+    else:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM transactions WHERE chat_id = ? ORDER BY id",
+                (chat_id,)).fetchall()
+        title_suffix = "Все операции"
+
+    wb = Workbook()
+    FONT = "Arial"
+    header_font = Font(name=FONT, bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill("solid", start_color="2F5496")
+    title_font = Font(name=FONT, bold=True, size=14)
+    normal_font = Font(name=FONT, size=10)
+    bold_font = Font(name=FONT, bold=True, size=10)
+    center = Alignment(horizontal="center")
+    right = Alignment(horizontal="right")
+    thin = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    money_fmt = '#,##0 ₽'
+    usdt_fmt = '#,##0.00'
+    rate_fmt = '0.0000'
+
+    def style_header(ws, ncols, row=1):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=row, column=c)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+            cell.border = border
+
+    # ── Лист 1: Операции ──
+    ws = wb.active
+    ws.title = "Операции"
+    ws["A1"] = f"TUZ УЧЁТ — {title_suffix}"
+    ws["A1"].font = title_font
+    ws["A2"] = f"Сформировано: {datetime.now(LOCAL_TZ).strftime('%d.%m.%Y %H:%M')}"
+    ws["A2"].font = Font(name=FONT, size=9, italic=True, color="808080")
+
+    headers = ["ID", "Дата/время", "Тип", "Контрагент", "USDT", "Курс", "Сумма ₽", "Статус", "Исходный текст"]
+    hrow = 4
+    for i, h in enumerate(headers, 1):
+        ws.cell(row=hrow, column=i, value=h)
+    style_header(ws, len(headers), hrow)
+
+    r = hrow + 1
+    for row in rows:
+        ws.cell(row=r, column=1, value=f"#{row['id']:03d}").font = normal_font
+        ws.cell(row=r, column=2, value=_ts_to_local_str(row["ts"])).font = normal_font
+        ws.cell(row=r, column=3, value=TYPE_LABELS.get(row["type"], row["type"])).font = normal_font
+        ws.cell(row=r, column=4, value=row["counterparty"] or "—").font = normal_font
+        c5 = ws.cell(row=r, column=5, value=round(row["usdt"], 2) if row["usdt"] else None)
+        c5.font = normal_font; c5.number_format = usdt_fmt
+        c6 = ws.cell(row=r, column=6, value=round(row["rate"], 4) if row["rate"] else None)
+        c6.font = normal_font; c6.number_format = rate_fmt
+        c7 = ws.cell(row=r, column=7, value=round(row["rubles"], 2) if row["rubles"] else None)
+        c7.font = normal_font; c7.number_format = money_fmt
+        st = "✓" if (row["status"] if "status" in row.keys() else "confirmed") == "confirmed" else "⏳ ждёт"
+        ws.cell(row=r, column=8, value=st).font = normal_font
+        ws.cell(row=r, column=9, value=row["raw_text"] or "").font = Font(name=FONT, size=9, color="808080")
+        r += 1
+
+    widths = [8, 18, 18, 22, 12, 10, 16, 10, 40]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[chr(64 + i)].width = w
+    ws.freeze_panes = "A5"
+
+    # ── Лист 2: Клиенты ──
+    clients = get_all_clients(chat_id)
+    if clients:
+        wc = wb.create_sheet("Клиенты")
+        wc["A1"] = "Клиенты по обороту USDT-сделок"
+        wc["A1"].font = title_font
+        chead = ["Клиент", "Сделок", "Продаж", "Покупок", "Оборот ₽", "Оборот USDT", "Ср. продажа", "Ср. закупка", "Спред ₽"]
+        for i, h in enumerate(chead, 1):
+            wc.cell(row=3, column=i, value=h)
+        style_header(wc, len(chead), 3)
+        cr = 4
+        for c in clients:
+            wc.cell(row=cr, column=1, value=c["display_name"]).font = bold_font
+            wc.cell(row=cr, column=2, value=c["ops"]).font = normal_font
+            wc.cell(row=cr, column=3, value=c["sell_count"]).font = normal_font
+            wc.cell(row=cr, column=4, value=c["buy_count"]).font = normal_font
+            x5 = wc.cell(row=cr, column=5, value=round(c["turnover_rub"], 2)); x5.font = normal_font; x5.number_format = money_fmt
+            x6 = wc.cell(row=cr, column=6, value=round(c["turnover_usdt"], 2)); x6.font = normal_font; x6.number_format = usdt_fmt
+            x7 = wc.cell(row=cr, column=7, value=round(c["avg_sell"], 4) if c["avg_sell"] else None); x7.font = normal_font; x7.number_format = rate_fmt
+            x8 = wc.cell(row=cr, column=8, value=round(c["avg_buy"], 4) if c["avg_buy"] else None); x8.font = normal_font; x8.number_format = rate_fmt
+            x9 = wc.cell(row=cr, column=9, value=round(c["spread"], 4) if c["spread"] is not None else None); x9.font = normal_font; x9.number_format = rate_fmt
+            cr += 1
+        for i, w in enumerate([22, 9, 9, 9, 16, 14, 12, 12, 10], 1):
+            wc.column_dimensions[chr(64 + i)].width = w
+        wc.freeze_panes = "A4"
+
+    # ── Лист 3: Долги ──
+    debts = get_debts(chat_id)
+    if debts["owed_to_us"] or debts["we_owe"]:
+        wd = wb.create_sheet("Долги")
+        wd["A1"] = "Открытые долги"
+        wd["A1"].font = title_font
+        wd.cell(row=3, column=1, value="Нам должны").font = bold_font
+        wd.cell(row=3, column=2, value="Сумма ₽").font = bold_font
+        dr = 4
+        for name, amt in debts["owed_to_us"]:
+            wd.cell(row=dr, column=1, value=name).font = normal_font
+            x = wd.cell(row=dr, column=2, value=round(amt, 2)); x.font = normal_font; x.number_format = money_fmt
+            dr += 1
+        tot = wd.cell(row=dr, column=1, value="ИТОГО нам должны"); tot.font = bold_font
+        x = wd.cell(row=dr, column=2, value=round(debts["total_owed_to_us"], 2)); x.font = bold_font; x.number_format = money_fmt
+        dr += 2
+        wd.cell(row=dr, column=1, value="Мы должны").font = bold_font
+        wd.cell(row=dr, column=2, value="Сумма ₽").font = bold_font
+        dr += 1
+        for name, amt in debts["we_owe"]:
+            wd.cell(row=dr, column=1, value=name).font = normal_font
+            x = wd.cell(row=dr, column=2, value=round(amt, 2)); x.font = normal_font; x.number_format = money_fmt
+            dr += 1
+        tot = wd.cell(row=dr, column=1, value="ИТОГО мы должны"); tot.font = bold_font
+        x = wd.cell(row=dr, column=2, value=round(debts["total_we_owe"], 2)); x.font = bold_font; x.number_format = money_fmt
+        wd.column_dimensions["A"].width = 28
+        wd.column_dimensions["B"].width = 18
+
+    # ── Лист 4: Сводка ──
+    state = get_state(chat_id)
+    rates = get_avg_rates(chat_id, period="all")
+    wsum = wb.create_sheet("Сводка")
+    wsum["A1"] = "Сводка"
+    wsum["A1"].font = title_font
+    summary = [
+        ("Касса (₽)", round(state["ruble_balance"], 2), money_fmt),
+        ("Кошелёк (USDT)", round(state["usdt_balance"], 2), usdt_fmt),
+        ("Средняя продажа (всё время)", round(rates["avg_sell"], 4) if rates["avg_sell"] else None, rate_fmt),
+        ("Средняя закупка (всё время)", round(rates["avg_buy"], 4) if rates["avg_buy"] else None, rate_fmt),
+        ("Спред (₽/USDT)", round(rates["spread"], 4) if rates["spread"] is not None else None, rate_fmt),
+        ("Реализованная прибыль (₽)", round(rates["realized_profit_rub"], 2) if rates["realized_profit_rub"] is not None else None, money_fmt),
+        ("Профит арбитража (USDT)", round(rates["arb_profit_usdt"], 2) if rates["arb_profit_usdt"] else None, usdt_fmt),
+        ("Всего операций в выгрузке", len(rows), "0"),
+    ]
+    sr = 3
+    for label, val, fmt in summary:
+        wsum.cell(row=sr, column=1, value=label).font = bold_font
+        cell = wsum.cell(row=sr, column=2, value=val)
+        cell.font = normal_font
+        if fmt:
+            cell.number_format = fmt
+        sr += 1
+    wsum.column_dimensions["A"].width = 32
+    wsum.column_dimensions["B"].width = 20
+
+    # Сохраняем во временный файл
+    suffix = period or "all"
+    out_path = DATA_DIR / f"export_{chat_id}_{suffix}_{datetime.now(LOCAL_TZ).strftime('%Y%m%d_%H%M')}.xlsx"
+    wb.save(out_path)
+    return str(out_path)
+
+
 # ────────────────── ПАРСИНГ ──────────────────
 NUM_PATTERN = r"\d[\d\s\u00a0.,]*\d|\d"
 
@@ -1106,6 +1316,20 @@ def parse_arbitrage_message(text: str):
         if t:
             trades.append((joined, t))
 
+    # Если блочное деление дало меньше 2 сделок (например, обе сделки были
+    # в одном блоке без пустой строки между ними) — пробуем построчно.
+    if len(trades) < 2:
+        line_trades = []
+        for line in text.split("\n"):
+            line = re.sub(r"^\d+\s*[\.\)]\s*", "", line.strip()).strip()
+            if not line or any(m in line.lower() for m in ARB_MARKERS):
+                continue
+            t = parse_trade(line)
+            if t:
+                line_trades.append((line, t))
+        if len(line_trades) >= 2:
+            trades = line_trades
+
     if len(trades) < 2:
         return None
 
@@ -1329,6 +1553,7 @@ HELP_MAIN = (
     "/balance · /stats · /rates · /history · /cashflow\n"
     "/debts · /debt · /client · /clients\n"
     "/day · /week · /month _(отчёты за период)_\n"
+    "/export · /backup _(выгрузка Excel и копия базы)_\n"
     "/find · /undo · /pending · /setcash · /settype · /confirm · /help"
 )
 
@@ -1346,7 +1571,7 @@ HELP_FIELD = (
     "`Дал в долг Серёге 50000`\n"
     "`Серёга вернул 50000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /history · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /find · /undo · /pending · /settype · /help"
+    "/balance · /history · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /export · /backup · /find · /undo · /pending · /settype · /help"
 )
 
 HELP_COMMON = (
@@ -1361,7 +1586,7 @@ HELP_COMMON = (
     "`Дал в долг MTX 1 000 000`\n"
     "`MTX вернул 500 000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /find · /undo · /history · /settype · /help"
+    "/balance · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /export · /backup · /find · /undo · /history · /settype · /help"
 )
 
 
@@ -1822,6 +2047,72 @@ async def on_week(message: Message):
 async def on_month(message: Message):
     agg = get_period_report(message.chat.id, "month")
     await message.answer(format_period_report(agg), parse_mode="Markdown")
+
+
+@dp.message(Command("export"))
+async def on_export(message: Message):
+    """Выгрузка операций в Excel. /export | /export day|week|month"""
+    parts = message.text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+    period = None
+    label = "все операции"
+    if arg in ("day", "день", "сегодня"):
+        period = "day"; label = "за сегодня"
+    elif arg in ("week", "неделя"):
+        period = "week"; label = "за неделю"
+    elif arg in ("month", "месяц"):
+        period = "month"; label = "за месяц"
+    elif arg:
+        await message.answer(
+            "Использование:\n"
+            "`/export` — все операции\n"
+            "`/export day` — за сегодня\n"
+            "`/export week` — за неделю\n"
+            "`/export month` — за месяц",
+            parse_mode="Markdown")
+        return
+
+    await message.answer("📊 Готовлю Excel-файл…")
+    try:
+        path = build_excel_export(message.chat.id, period=period)
+    except Exception as e:
+        log.exception("Ошибка экспорта")
+        await message.answer(f"Не удалось собрать файл: {e}")
+        return
+
+    try:
+        doc = FSInputFile(path, filename=Path(path).name)
+        await message.answer_document(
+            doc, caption=f"📊 Выгрузка ({label}). Открывается в Excel / Google Таблицах.")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+@dp.message(Command("backup"))
+async def on_backup(message: Message):
+    """Шлёт файл базы данных — резервная копия. Храни в надёжном месте."""
+    if not DB_PATH.exists():
+        await message.answer("База ещё пуста — нечего сохранять.")
+        return
+    await message.answer("💾 Готовлю резервную копию базы…")
+    try:
+        stamp = datetime.now(LOCAL_TZ).strftime("%Y%m%d_%H%M")
+        doc = FSInputFile(str(DB_PATH), filename=f"trades_backup_{stamp}.db")
+        await message.answer_document(
+            doc,
+            caption=(
+                "💾 *Резервная копия базы*\n\n"
+                "Сохрани этот файл. Если что-то случится с ботом или сервером — "
+                "пришли мне его обратно, и я подскажу как восстановить.\n\n"
+                "_Делай бэкап раз в несколько дней или после большого объёма операций._"
+            ),
+            parse_mode="Markdown")
+    except Exception as e:
+        log.exception("Ошибка бэкапа")
+        await message.answer(f"Не удалось отправить базу: {e}")
 
 
 @dp.message(Command("pending"))
