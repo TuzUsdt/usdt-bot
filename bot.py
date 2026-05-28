@@ -36,7 +36,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -54,6 +54,11 @@ from aiogram.types import (
 # ────────────────── НАСТРОЙКИ ──────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_PATH = Path(__file__).parent / "trades.db"
+
+# Часовой пояс пользователя для отчётов (Красноярск = UTC+7).
+# Можно переопределить переменной окружения TZ_OFFSET (в часах).
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET", "7"))
+LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
 
 if not BOT_TOKEN:
     raise SystemExit(
@@ -233,29 +238,153 @@ def save_tx(chat_id, type_, counterparty, rubles, *, usdt=0, rate=0, raw="",
         return cur.lastrowid
 
 
-def get_avg_rates(chat_id: int) -> dict:
-    """Средневзвешенные курсы — только по confirmed транзакциям."""
+def get_avg_rates_excluding(chat_id: int, exclude_id: int, period: str = "cycle") -> dict:
+    """
+    То же что get_avg_rates, но исключает транзакцию с указанным id.
+    Используется чтобы посчитать средние ДО только что записанной сделки —
+    для подсветки невыгодных сделок («продал по 73, а средняя закупка 74.5»).
+    """
+    where = "chat_id = ? AND status = 'confirmed' AND id != ?"
+    params = [chat_id, exclude_id]
+
+    if period == "cycle":
+        start_id = get_cycle_start_id(chat_id)
+        if start_id > 0 and start_id <= exclude_id:
+            # Цикл может включать только что добавленную операцию — используем её как старт,
+            # но не уходим назад если она открыла цикл сама
+            where += " AND id >= ?"
+            params.append(start_id)
+
     with db() as conn:
         sell = conn.execute(
-            "SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
-            "FROM transactions WHERE chat_id = ? AND type = 'sell' AND status = 'confirmed'",
-            (chat_id,)).fetchone()
+            f"SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
+            f"FROM transactions WHERE {where} AND type = 'sell'",
+            params).fetchone()
         buy = conn.execute(
-            "SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
-            "FROM transactions WHERE chat_id = ? AND type = 'buy' AND status = 'confirmed'",
-            (chat_id,)).fetchone()
-        arb_profit = conn.execute(
-            "SELECT COALESCE(SUM(usdt),0) p FROM transactions "
-            "WHERE chat_id = ? AND type = 'arb' AND status = 'confirmed'",
-            (chat_id,)).fetchone()
+            f"SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
+            f"FROM transactions WHERE {where} AND type = 'buy'",
+            params).fetchone()
     return {
-        "avg_sell":          (sell["r"] / sell["u"]) if sell["u"] else None,
-        "avg_buy":           (buy["r"]  / buy["u"])  if buy["u"]  else None,
+        "avg_sell": (sell["r"] / sell["u"]) if sell["u"] else None,
+        "avg_buy":  (buy["r"]  / buy["u"])  if buy["u"]  else None,
+    }
+
+
+def get_cycle_start_id(chat_id: int, cycle_zero_threshold: float = 10.0) -> int:
+    """
+    Возвращает ID первой транзакции ТЕКУЩЕГО цикла.
+
+    Цикл = период между моментами, когда USDT-кошелёк был ≤ порога (по умолчанию 10).
+    Алгоритм:
+      1. Берём ВСЕ confirmed транзакции в хронологическом порядке.
+      2. Симулируем USDT-баланс с нуля.
+      3. Запоминаем ID последней операции, ПОСЛЕ которой баланс упал до ≤ порога.
+      4. Текущий цикл = всё что идёт ПОСЛЕ этой операции.
+      5. Если кошелёк никогда не обнулялся — текущий цикл = весь учёт.
+
+    Возвращает 0 если транзакций нет или цикл начался с самого начала.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, type, usdt FROM transactions "
+            "WHERE chat_id = ? AND status = 'confirmed' "
+            "AND type IN ('sell', 'buy', 'arb') "
+            "ORDER BY id",
+            (chat_id,)).fetchall()
+
+    balance = 0.0
+    last_zero_id = 0
+    for r in rows:
+        t = r["type"]
+        u = r["usdt"] or 0
+        if t == "buy":
+            balance += u
+        elif t == "sell":
+            balance -= u
+        elif t == "arb":
+            balance += u  # арбитраж даёт профит в USDT
+        if balance <= cycle_zero_threshold:
+            last_zero_id = r["id"]
+
+    # Текущий цикл начинается с ПЕРВОЙ транзакции после last_zero_id
+    with db() as conn:
+        nxt = conn.execute(
+            "SELECT MIN(id) AS mid FROM transactions "
+            "WHERE chat_id = ? AND id > ? AND status = 'confirmed' "
+            "AND type IN ('sell', 'buy', 'arb')",
+            (chat_id, last_zero_id)).fetchone()
+    return nxt["mid"] or 0
+
+
+def get_avg_rates(chat_id: int, period: str = "all", days: int = 30) -> dict:
+    """
+    Средневзвешенные курсы — только по confirmed транзакциям.
+
+    period:
+      'all'   — всё время (по умолчанию)
+      'cycle' — текущий цикл (с момента когда кошелёк был ≤ 10 USDT)
+      'days'  — последние `days` дней (по умолчанию 30)
+    """
+    # WHERE-условие и параметры
+    where = "chat_id = ? AND status = 'confirmed'"
+    params = [chat_id]
+
+    if period == "cycle":
+        start_id = get_cycle_start_id(chat_id)
+        if start_id > 0:
+            where += " AND id >= ?"
+            params.append(start_id)
+        # если start_id == 0 — цикл = всё время (нет старых обнулений)
+    elif period == "days":
+        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        where += " AND ts >= ?"
+        params.append(cutoff)
+    # period == 'all' — без фильтров
+
+    with db() as conn:
+        sell = conn.execute(
+            f"SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
+            f"FROM transactions WHERE {where} AND type = 'sell'",
+            params).fetchone()
+        buy = conn.execute(
+            f"SELECT COALESCE(SUM(rubles),0) r, COALESCE(SUM(usdt),0) u "
+            f"FROM transactions WHERE {where} AND type = 'buy'",
+            params).fetchone()
+        arb_profit = conn.execute(
+            f"SELECT COALESCE(SUM(usdt),0) p FROM transactions "
+            f"WHERE {where} AND type = 'arb'",
+            params).fetchone()
+        tx_count = conn.execute(
+            f"SELECT COUNT(*) AS c FROM transactions WHERE {where} "
+            f"AND type IN ('sell','buy','arb')",
+            params).fetchone()
+
+    avg_sell = (sell["r"] / sell["u"]) if sell["u"] else None
+    avg_buy  = (buy["r"]  / buy["u"])  if buy["u"]  else None
+
+    # Реализованная прибыль = (продано USDT) × (средняя продажа − средняя закупка) + арбитраж × средняя продажа
+    realized_profit_rub = None
+    if avg_sell is not None and avg_buy is not None and sell["u"] > 0:
+        # Сколько USDT реально «прошло» через цикл купи-продай
+        traded_usdt = min(sell["u"], buy["u"])
+        realized_profit_rub = traded_usdt * (avg_sell - avg_buy)
+        # Арбитражный профит в USDT × текущая средняя цена продажи
+        if arb_profit["p"] > 0:
+            realized_profit_rub += arb_profit["p"] * avg_sell
+
+    return {
+        "period":            period,
+        "days":              days if period == "days" else None,
+        "avg_sell":          avg_sell,
+        "avg_buy":           avg_buy,
+        "spread":            (avg_sell - avg_buy) if (avg_sell and avg_buy) else None,
         "total_sold_usdt":   sell["u"],
         "total_bought_usdt": buy["u"],
         "total_received":    sell["r"],
         "total_spent":       buy["r"],
         "arb_profit_usdt":   arb_profit["p"],
+        "tx_count":          tx_count["c"],
+        "realized_profit_rub": realized_profit_rub,
     }
 
 
@@ -362,6 +491,304 @@ def get_debt_history(chat_id: int, name: str) -> list:
             (chat_id,)).fetchall()
     # Фильтруем по корню
     return [r for r in rows if name_root(r["counterparty"] or "") == target_root]
+
+
+# ───── Клиенты ─────
+def get_client_stats(chat_id: int, name: str) -> dict:
+    """
+    Полная статистика по одному клиенту (по корню имени — учитывает падежи и @username).
+
+    Возвращает dict с агрегатами по сделкам, кэшу и долгам, либо None если
+    операций с этим контрагентом нет.
+    """
+    target_root = name_root(name)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "ORDER BY id",
+            (chat_id,)).fetchall()
+
+    mine = [r for r in rows
+            if name_root(r["counterparty"] or "") == target_root
+            or name_root(r["partner_in"] or "") == target_root
+            or name_root(r["partner_out"] or "") == target_root]
+    if not mine:
+        return None
+
+    # Отображаемое имя — самое частое написание
+    name_counts = {}
+    for r in mine:
+        cp = r["counterparty"]
+        if cp and name_root(cp) == target_root:
+            name_counts[cp] = name_counts.get(cp, 0) + 1
+    display_name = max(name_counts, key=name_counts.get) if name_counts else name
+
+    sell_usdt = sell_rub = 0.0
+    buy_usdt = buy_rub = 0.0
+    sell_count = buy_count = 0
+    cash_in = cash_out = 0.0
+    loan_out = loan_in = repay_in = repay_out = 0.0
+    arb_count = 0
+    first_id = mine[0]["id"]
+    last_id = mine[-1]["id"]
+    first_ts = mine[0]["ts"]
+    last_ts = mine[-1]["ts"]
+
+    for r in mine:
+        t = r["type"]
+        if t == "sell":
+            sell_usdt += r["usdt"] or 0; sell_rub += r["rubles"] or 0; sell_count += 1
+        elif t == "buy":
+            buy_usdt += r["usdt"] or 0; buy_rub += r["rubles"] or 0; buy_count += 1
+        elif t == "cash_in":
+            cash_in += r["rubles"] or 0
+        elif t == "cash_out":
+            cash_out += r["rubles"] or 0
+        elif t == "loan_out":
+            loan_out += r["rubles"] or 0
+        elif t == "loan_in":
+            loan_in += r["rubles"] or 0
+        elif t == "debt_repay_in":
+            repay_in += r["rubles"] or 0
+        elif t == "debt_repay_out":
+            repay_out += r["rubles"] or 0
+        elif t == "arb":
+            arb_count += 1
+
+    avg_sell = (sell_rub / sell_usdt) if sell_usdt else None
+    avg_buy = (buy_rub / buy_usdt) if buy_usdt else None
+    # Спред с клиентом: если он у нас покупает (наш sell) и продаёт нам (наш buy)
+    spread = (avg_sell - avg_buy) if (avg_sell and avg_buy) else None
+
+    debt_balance = (loan_out - repay_in) - (loan_in - repay_out)  # >0 он нам должен
+
+    return {
+        "display_name":   display_name,
+        "root":           target_root,
+        "total_ops":      len(mine),
+        "sell_count":     sell_count,
+        "buy_count":      buy_count,
+        "sell_usdt":      sell_usdt,
+        "buy_usdt":       buy_usdt,
+        "sell_rub":       sell_rub,
+        "buy_rub":        buy_rub,
+        "avg_sell":       avg_sell,
+        "avg_buy":        avg_buy,
+        "spread":         spread,
+        "turnover_rub":   sell_rub + buy_rub,
+        "turnover_usdt":  sell_usdt + buy_usdt,
+        "cash_in":        cash_in,
+        "cash_out":       cash_out,
+        "loan_out":       loan_out,
+        "loan_in":        loan_in,
+        "repay_in":       repay_in,
+        "repay_out":      repay_out,
+        "debt_balance":   debt_balance,
+        "arb_count":      arb_count,
+        "first_id":       first_id,
+        "last_id":        last_id,
+        "first_ts":       first_ts,
+        "last_ts":        last_ts,
+        "rows":           mine,
+    }
+
+
+def get_all_clients(chat_id: int) -> list:
+    """
+    Список всех клиентов с агрегатами по обороту USDT-сделок.
+    Возвращает список dict, отсортированный по обороту (рубли) убыв.
+    Учитывает только тех, с кем были USDT-сделки (sell/buy) — чистые
+    кэш-контрагенты и должники не считаются «клиентами по USDT».
+    """
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND type IN ('sell', 'buy') ORDER BY id",
+            (chat_id,)).fetchall()
+
+    clients = {}  # root → агрегат
+    for r in rows:
+        cp = r["counterparty"] or "—"
+        root = name_root(cp)
+        c = clients.setdefault(root, {
+            "display_name": cp, "name_counts": {},
+            "turnover_rub": 0.0, "turnover_usdt": 0.0,
+            "sell_count": 0, "buy_count": 0,
+            "sell_usdt": 0.0, "sell_rub": 0.0,
+            "buy_usdt": 0.0, "buy_rub": 0.0,
+            "last_id": 0,
+        })
+        c["name_counts"][cp] = c["name_counts"].get(cp, 0) + 1
+        c["turnover_rub"] += r["rubles"] or 0
+        c["turnover_usdt"] += r["usdt"] or 0
+        c["last_id"] = max(c["last_id"], r["id"])
+        if r["type"] == "sell":
+            c["sell_count"] += 1; c["sell_usdt"] += r["usdt"] or 0; c["sell_rub"] += r["rubles"] or 0
+        else:
+            c["buy_count"] += 1; c["buy_usdt"] += r["usdt"] or 0; c["buy_rub"] += r["rubles"] or 0
+
+    result = []
+    for root, c in clients.items():
+        display = max(c["name_counts"], key=c["name_counts"].get)
+        avg_sell = (c["sell_rub"] / c["sell_usdt"]) if c["sell_usdt"] else None
+        avg_buy = (c["buy_rub"] / c["buy_usdt"]) if c["buy_usdt"] else None
+        spread = (avg_sell - avg_buy) if (avg_sell and avg_buy) else None
+        result.append({
+            "root": root, "display_name": display,
+            "turnover_rub": c["turnover_rub"], "turnover_usdt": c["turnover_usdt"],
+            "ops": c["sell_count"] + c["buy_count"],
+            "sell_count": c["sell_count"], "buy_count": c["buy_count"],
+            "avg_sell": avg_sell, "avg_buy": avg_buy, "spread": spread,
+            "last_id": c["last_id"],
+        })
+    result.sort(key=lambda x: -x["turnover_rub"])
+    return result
+
+
+# ───── Отчёты за период ─────
+def _period_bounds(period: str):
+    """
+    Возвращает (start_utc_iso, end_utc_iso, title) для периода в ЛОКАЛЬНОМ времени
+    пользователя (LOCAL_TZ), сконвертированные в UTC-строки для сравнения с ts.
+
+    period: 'day' | 'week' | 'month'
+    """
+    now_local = datetime.now(LOCAL_TZ)
+    if period == "day":
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        title = "Сегодня (" + start_local.strftime("%d.%m") + ")"
+    elif period == "week":
+        # Неделя с понедельника
+        monday = now_local - timedelta(days=now_local.weekday())
+        start_local = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        title = "Эта неделя (с " + start_local.strftime("%d.%m") + ")"
+    elif period == "month":
+        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        title = "Этот месяц (" + start_local.strftime("%B %Y") + ")"
+    else:
+        raise ValueError(period)
+
+    # Конвертируем границы в UTC и в тот же ISO-формат что хранится в ts
+    start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+    end_utc = now_local.astimezone(timezone.utc).replace(tzinfo=None)
+    return start_utc.isoformat(), end_utc.isoformat(), title
+
+
+def get_period_report(chat_id: int, period: str) -> dict:
+    """
+    Сводка по всем операциям за период (day/week/month) в локальном времени.
+    """
+    start_iso, end_iso, title = _period_bounds(period)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND ts >= ? AND ts <= ? ORDER BY id",
+            (chat_id, start_iso, end_iso)).fetchall()
+
+    agg = {
+        "title": title, "period": period, "count": len(rows),
+        "sell_usdt": 0.0, "sell_rub": 0.0, "sell_count": 0,
+        "buy_usdt": 0.0, "buy_rub": 0.0, "buy_count": 0,
+        "arb_profit": 0.0, "arb_count": 0,
+        "cash_in": 0.0, "cash_out": 0.0,
+        "loan_out": 0.0, "loan_in": 0.0, "repay_in": 0.0, "repay_out": 0.0,
+        "clients": set(),
+    }
+    for r in rows:
+        t = r["type"]
+        cp = r["counterparty"]
+        if t == "sell":
+            agg["sell_usdt"] += r["usdt"] or 0; agg["sell_rub"] += r["rubles"] or 0
+            agg["sell_count"] += 1
+            if cp: agg["clients"].add(name_root(cp))
+        elif t == "buy":
+            agg["buy_usdt"] += r["usdt"] or 0; agg["buy_rub"] += r["rubles"] or 0
+            agg["buy_count"] += 1
+            if cp: agg["clients"].add(name_root(cp))
+        elif t == "arb":
+            agg["arb_profit"] += r["usdt"] or 0; agg["arb_count"] += 1
+        elif t == "cash_in":
+            agg["cash_in"] += r["rubles"] or 0
+        elif t == "cash_out":
+            agg["cash_out"] += r["rubles"] or 0
+        elif t == "loan_out":
+            agg["loan_out"] += r["rubles"] or 0
+        elif t == "loan_in":
+            agg["loan_in"] += r["rubles"] or 0
+        elif t == "debt_repay_in":
+            agg["repay_in"] += r["rubles"] or 0
+        elif t == "debt_repay_out":
+            agg["repay_out"] += r["rubles"] or 0
+
+    agg["avg_sell"] = (agg["sell_rub"] / agg["sell_usdt"]) if agg["sell_usdt"] else None
+    agg["avg_buy"] = (agg["buy_rub"] / agg["buy_usdt"]) if agg["buy_usdt"] else None
+    agg["spread"] = (agg["avg_sell"] - agg["avg_buy"]) if (agg["avg_sell"] and agg["avg_buy"]) else None
+    # Реализованная прибыль за период (по сделкам периода)
+    if agg["avg_sell"] and agg["avg_buy"]:
+        traded = min(agg["sell_usdt"], agg["buy_usdt"])
+        agg["realized_profit"] = traded * (agg["avg_sell"] - agg["avg_buy"])
+    else:
+        agg["realized_profit"] = None
+    agg["n_clients"] = len(agg["clients"])
+    return agg
+
+
+def format_period_report(agg: dict) -> str:
+    """Текст отчёта за период."""
+    lines = [f"📅 *Отчёт — {agg['title']}*"]
+    if agg["count"] == 0:
+        lines.append("\nОпераций не было.")
+        return "\n".join(lines)
+    lines.append(f"_{agg['count']} операций_\n")
+
+    # USDT-сделки
+    if agg["sell_count"] or agg["buy_count"]:
+        lines.append("📊 *USDT-сделки:*")
+        if agg["sell_count"]:
+            lines.append(f"   📤 Продано: {fmt_usdt(agg['sell_usdt'])} "
+                         f"на {fmt_rub(agg['sell_rub'])}"
+                         + (f" (ср. {fmt_rate(agg['avg_sell'])})" if agg["avg_sell"] else ""))
+        if agg["buy_count"]:
+            lines.append(f"   📥 Куплено: {fmt_usdt(agg['buy_usdt'])} "
+                         f"за {fmt_rub(agg['buy_rub'])}"
+                         + (f" (ср. {fmt_rate(agg['avg_buy'])})" if agg["avg_buy"] else ""))
+        if agg["spread"] is not None:
+            sign = "+" if agg["spread"] >= 0 else ""
+            lines.append(f"   📈 Спред: {sign}{agg['spread']:.3f}₽/USDT")
+        if agg["realized_profit"] is not None:
+            ps = "+" if agg["realized_profit"] >= 0 else "−"
+            lines.append(f"   💵 Прибыль с оборота: {ps}{fmt_rub(abs(agg['realized_profit']))}")
+        if agg["n_clients"]:
+            lines.append(f"   👥 Клиентов: {agg['n_clients']}")
+
+    if agg["arb_count"]:
+        lines.append(f"\n🔄 *Арбитраж:* {agg['arb_count']} сделок, "
+                     f"профит +{fmt_usdt(agg['arb_profit'])}")
+
+    # Кэш
+    if agg["cash_in"] or agg["cash_out"]:
+        lines.append("\n💵 *Кэш:*")
+        if agg["cash_in"]:
+            lines.append(f"   Приход: +{fmt_rub(agg['cash_in'])}")
+        if agg["cash_out"]:
+            lines.append(f"   Расход: −{fmt_rub(agg['cash_out'])}")
+        net = agg["cash_in"] - agg["cash_out"]
+        ns = "+" if net >= 0 else "−"
+        lines.append(f"   Итого: {ns}{fmt_rub(abs(net))}")
+
+    # Долги
+    if agg["loan_out"] or agg["loan_in"] or agg["repay_in"] or agg["repay_out"]:
+        lines.append("\n💳 *Долги за период:*")
+        if agg["loan_out"]:
+            lines.append(f"   Выдал в долг: {fmt_rub(agg['loan_out'])}")
+        if agg["repay_in"]:
+            lines.append(f"   Вернули нам: {fmt_rub(agg['repay_in'])}")
+        if agg["loan_in"]:
+            lines.append(f"   Заняли мы: {fmt_rub(agg['loan_in'])}")
+        if agg["repay_out"]:
+            lines.append(f"   Вернули мы: {fmt_rub(agg['repay_out'])}")
+
+    return "\n".join(lines)
 
 
 # ────────────────── ПАРСИНГ ──────────────────
@@ -896,8 +1323,12 @@ HELP_MAIN = (
     "```\nСделка без моих средств\n"
     "Купил у Германа 196500/75=2620\n"
     "Продал Стефу 196500/75.5=2602\n```\n"
+    "👤 *Клиенты:* пиши имя или @username в сделке —\n"
+    "`Продал @vasya_crypto 1000*76` — бот сам ведёт по клиенту статистику.\n\n"
     "📊 *Команды:*\n"
-    "/balance · /stats · /history · /cashflow · /debts · /debt\n"
+    "/balance · /stats · /rates · /history · /cashflow\n"
+    "/debts · /debt · /client · /clients\n"
+    "/day · /week · /month _(отчёты за период)_\n"
     "/find · /undo · /pending · /setcash · /settype · /confirm · /help"
 )
 
@@ -915,7 +1346,7 @@ HELP_FIELD = (
     "`Дал в долг Серёге 50000`\n"
     "`Серёга вернул 50000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /history · /cashflow · /debts · /find · /undo · /pending · /settype · /help"
+    "/balance · /history · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /find · /undo · /pending · /settype · /help"
 )
 
 HELP_COMMON = (
@@ -930,7 +1361,7 @@ HELP_COMMON = (
     "`Дал в долг MTX 1 000 000`\n"
     "`MTX вернул 500 000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /cashflow · /debts · /find · /undo · /history · /settype · /help"
+    "/balance · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /find · /undo · /history · /settype · /help"
 )
 
 
@@ -1013,6 +1444,20 @@ async def on_balance(message: Message):
             (message.chat.id,)).fetchone()["c"]
     if pending:
         text += f"\n⏳ Не подтверждено: *{pending}* (см. /pending)"
+
+    # Краткая сводка по курсам текущего цикла
+    cycle = get_avg_rates(message.chat.id, period="cycle")
+    if cycle["avg_buy"] or cycle["avg_sell"]:
+        text += "\n\n📊 *Цикл:*"
+        if cycle["avg_buy"]:
+            text += f"\n   📥 Ср. закупка: {fmt_rate(cycle['avg_buy'])}"
+        if cycle["avg_sell"]:
+            text += f"\n   📤 Ср. продажа: {fmt_rate(cycle['avg_sell'])}"
+        if cycle["spread"] is not None:
+            sign = "+" if cycle["spread"] >= 0 else ""
+            text += f"\n   📈 Спред: {sign}{cycle['spread']:.3f}₽/USDT"
+        text += "\n   _Подробнее: /rates_"
+
     await message.answer(text, parse_mode="Markdown")
 
 
@@ -1047,6 +1492,92 @@ async def on_stats(message: Message):
 
     lines.append(f"\n💰 Касса: {fmt_rub(s['ruble_balance'])}")
     lines.append(f"💵 Кошелёк: {fmt_usdt(s['usdt_balance'])}")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("rates"))
+async def on_rates(message: Message):
+    """
+    /rates           — текущий цикл
+    /rates cycle     — текущий цикл (явно)
+    /rates all       — всё время
+    /rates 30d       — последние N дней (3d, 7d, 30d, 90d ...)
+    """
+    parts = message.text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else "cycle"
+
+    period = "cycle"
+    days = 30
+    period_title = "Текущий цикл"
+
+    if arg == "all":
+        period = "all"
+        period_title = "Всё время"
+    elif arg == "cycle":
+        period = "cycle"
+        period_title = "Текущий цикл"
+    elif re.match(r"^\d+d$", arg):
+        period = "days"
+        days = int(arg[:-1])
+        period_title = f"Последние {days} дн."
+    else:
+        await message.answer(
+            "Использование: `/rates` `[cycle|all|30d]`\n"
+            "Примеры:\n"
+            "`/rates`        — текущий цикл (по умолчанию)\n"
+            "`/rates all`    — всё время\n"
+            "`/rates 30d`    — последние 30 дней\n"
+            "`/rates 7d`     — последние 7 дней",
+            parse_mode="Markdown")
+        return
+
+    r = get_avg_rates(message.chat.id, period=period, days=days)
+    s = get_state(message.chat.id)
+
+    if not r["avg_sell"] and not r["avg_buy"] and not r["arb_profit_usdt"]:
+        await message.answer(f"📊 *{period_title}*\n\nUSDT-сделок в этом периоде нет.",
+                             parse_mode="Markdown")
+        return
+
+    lines = [f"📊 *Курсы — {period_title}*",
+             f"_({r['tx_count']} USDT-операций)_\n"]
+
+    if r["avg_buy"]:
+        lines.append(f"📥 *Средняя закупка:* {fmt_rate(r['avg_buy'])}")
+        lines.append(f"   {fmt_usdt(r['total_bought_usdt'])} за {fmt_rub(r['total_spent'])}")
+    if r["avg_sell"]:
+        lines.append(f"📤 *Средняя продажа:* {fmt_rate(r['avg_sell'])}")
+        lines.append(f"   {fmt_usdt(r['total_sold_usdt'])} → {fmt_rub(r['total_received'])}")
+
+    if r["spread"] is not None:
+        spread_sign = "+" if r["spread"] >= 0 else ""
+        spread_emoji = "📈" if r["spread"] >= 0 else "📉"
+        lines.append(f"\n{spread_emoji} *Спред: {spread_sign}{r['spread']:.3f} ₽/USDT*")
+
+    if r["realized_profit_rub"] is not None:
+        profit_sign = "+" if r["realized_profit_rub"] >= 0 else "−"
+        lines.append(f"💵 *Реализованная прибыль: {profit_sign}{fmt_rub(abs(r['realized_profit_rub']))}*")
+
+    if r["arb_profit_usdt"]:
+        lines.append(f"🔄 Профит от арбитража: +{fmt_usdt(r['arb_profit_usdt'])}")
+
+    # ⚖️ Безубыток — только если есть и закупки, и продажи
+    if r["avg_sell"] and r["avg_buy"]:
+        lines.append(f"\n⚖️ *Безубыток:*")
+        lines.append(f"   • Продавай НЕ дешевле *{fmt_rate(r['avg_buy'])}*  (≤ средняя закупка = убыток)")
+        lines.append(f"   • Покупай НЕ дороже *{fmt_rate(r['avg_sell'])}*   (≥ средняя продажа = убыток)")
+
+    # Оценка текущей позиции
+    if s["usdt_balance"] > 0.01 and r["avg_sell"]:
+        potential = s["usdt_balance"] * r["avg_sell"]
+        lines.append(f"\n💼 *Сейчас в кошельке:* {fmt_usdt(s['usdt_balance'])}")
+        lines.append(f"   По средней продаже = ~{fmt_rub(potential)}")
+
+    # Подсказка
+    if period == "cycle":
+        lines.append("\n_Цикл = с момента когда кошелёк был ≤ 10 USDT_")
+        lines.append("_`/rates all` — всё время, `/rates 30d` — за 30 дней_")
+
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -1170,6 +1701,129 @@ async def on_debt(message: Message):
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
+@dp.message(Command("client"))
+async def on_client(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: `/client <имя | @username>`\n"
+            "Например: `/client Стеф` или `/client @vasya_crypto`",
+            parse_mode="Markdown")
+        return
+    name = parts[1].strip()
+    c = get_client_stats(message.chat.id, name)
+    if not c:
+        await message.answer(f"Операций с «{name}» не нашёл.")
+        return
+
+    lines = [f"👤 *{c['display_name']}*  ({c['total_ops']} операций)\n"]
+
+    # USDT-сделки
+    if c["sell_count"] or c["buy_count"]:
+        lines.append("📊 *USDT-сделки:*")
+        if c["sell_count"]:
+            lines.append(f"   📤 Продал ему: {c['sell_count']} раз, "
+                         f"{fmt_usdt(c['sell_usdt'])} на {fmt_rub(c['sell_rub'])}")
+            if c["avg_sell"]:
+                lines.append(f"      ср. курс продажи {fmt_rate(c['avg_sell'])}")
+        if c["buy_count"]:
+            lines.append(f"   📥 Купил у него: {c['buy_count']} раз, "
+                         f"{fmt_usdt(c['buy_usdt'])} на {fmt_rub(c['buy_rub'])}")
+            if c["avg_buy"]:
+                lines.append(f"      ср. курс закупки {fmt_rate(c['avg_buy'])}")
+        if c["spread"] is not None:
+            sign = "+" if c["spread"] >= 0 else ""
+            emoji = "📈" if c["spread"] >= 0 else "📉"
+            lines.append(f"   {emoji} Спред с ним: {sign}{c['spread']:.3f}₽/USDT")
+        lines.append(f"   💰 Оборот: {fmt_rub(c['turnover_rub'])} / {fmt_usdt(c['turnover_usdt'])}")
+
+    # Кэш
+    if c["cash_in"] or c["cash_out"]:
+        lines.append("\n💵 *Кэш:*")
+        if c["cash_in"]:
+            lines.append(f"   Принял от него: {fmt_rub(c['cash_in'])}")
+        if c["cash_out"]:
+            lines.append(f"   Выдал ему: {fmt_rub(c['cash_out'])}")
+
+    # Долги
+    if c["loan_out"] or c["loan_in"] or c["repay_in"] or c["repay_out"]:
+        lines.append("\n💳 *Долги:*")
+        if c["debt_balance"] > 0.01:
+            lines.append(f"   📥 Должен нам сейчас: *{fmt_rub(c['debt_balance'])}*")
+        elif c["debt_balance"] < -0.01:
+            lines.append(f"   📤 Мы должны ему: *{fmt_rub(-c['debt_balance'])}*")
+        else:
+            lines.append("   ✅ По долгам в расчёте")
+
+    if c["arb_count"]:
+        lines.append(f"\n🔄 Участвовал в {c['arb_count']} арбитражных сделках")
+
+    lines.append(f"\n_Операции {fmt_id(c['first_id'])}…{fmt_id(c['last_id'])}_")
+    lines.append("_Вся история: /find " + c["display_name"] + "_")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("clients"))
+async def on_clients(message: Message):
+    parts = message.text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    clients = get_all_clients(message.chat.id)
+    if not clients:
+        await message.answer("USDT-сделок с клиентами ещё не было.")
+        return
+
+    # Сортировка
+    sort_label = "по обороту"
+    if arg in ("spread", "спред"):
+        clients = [c for c in clients if c["spread"] is not None]
+        clients.sort(key=lambda x: -(x["spread"] or 0))
+        sort_label = "по спреду (выгодные сверху)"
+    elif arg in ("ops", "частые", "count"):
+        clients.sort(key=lambda x: -x["ops"])
+        sort_label = "по числу сделок"
+    # иначе уже отсортировано по обороту
+
+    top = clients[:15]
+    lines = [f"👥 *Клиенты ({len(clients)}) — {sort_label}:*\n"]
+    for i, c in enumerate(top, 1):
+        spread_str = ""
+        if c["spread"] is not None:
+            sign = "+" if c["spread"] >= 0 else ""
+            spread_str = f", спред {sign}{c['spread']:.2f}"
+        lines.append(
+            f"{i}. *{c['display_name']}* — {fmt_rub(c['turnover_rub'])} "
+            f"({c['ops']} сд.{spread_str})"
+        )
+
+    if len(clients) > 15:
+        lines.append(f"\n_…и ещё {len(clients) - 15}_")
+
+    lines.append("\n_Детали: `/client <имя>`_")
+    lines.append("_Сортировка: `/clients spread` · `/clients частые`_")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("day"))
+async def on_day(message: Message):
+    agg = get_period_report(message.chat.id, "day")
+    await message.answer(format_period_report(agg), parse_mode="Markdown")
+
+
+@dp.message(Command("week"))
+async def on_week(message: Message):
+    agg = get_period_report(message.chat.id, "week")
+    await message.answer(format_period_report(agg), parse_mode="Markdown")
+
+
+@dp.message(Command("month"))
+async def on_month(message: Message):
+    agg = get_period_report(message.chat.id, "month")
+    await message.answer(format_period_report(agg), parse_mode="Markdown")
+
+
 @dp.message(Command("pending"))
 async def on_pending(message: Message):
     with db() as conn:
@@ -1259,18 +1913,48 @@ async def on_find(message: Message):
 @dp.message(Command("undo"))
 async def on_undo(message: Message):
     chat_id = message.chat.id
-    with db() as conn:
-        row = conn.execute(
-            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
-            "ORDER BY id DESC LIMIT 1",
-            (chat_id,)).fetchone()
-        if not row:
-            await message.answer("Отменять нечего.")
+    parts = message.text.split(maxsplit=1)
+
+    # /undo #142 — отменить конкретную операцию
+    target_id = None
+    if len(parts) > 1:
+        m = re.match(r"^#?(\d+)$", parts[1].strip().replace(" ", ""))
+        if m:
+            target_id = int(m.group(1))
+        else:
+            await message.answer(
+                "Использование:\n"
+                "`/undo` — отменить последнюю операцию\n"
+                "`/undo #142` — отменить операцию по номеру",
+                parse_mode="Markdown")
             return
+
+    with db() as conn:
+        if target_id is not None:
+            row = conn.execute(
+                "SELECT * FROM transactions WHERE chat_id = ? AND id = ? AND status = 'confirmed'",
+                (chat_id, target_id)).fetchone()
+            if not row:
+                await message.answer(
+                    f"Операцию {fmt_id(target_id)} не нашёл "
+                    "(возможно, она в другом чате или уже отменена).")
+                return
+        else:
+            row = conn.execute(
+                "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+                "ORDER BY id DESC LIMIT 1",
+                (chat_id,)).fetchone()
+            if not row:
+                await message.answer("Отменять нечего.")
+                return
         conn.execute("DELETE FROM transactions WHERE id = ?", (row["id"],))
 
     reverse_balance(chat_id, row)
-    await message.answer(f"↩️ Отменил {fmt_id(row['id'])}: `{row['raw_text']}`", parse_mode="Markdown")
+    s = get_state(chat_id)
+    await message.answer(
+        f"↩️ Отменил {fmt_id(row['id'])}: `{row['raw_text']}`\n"
+        f"💰 Касса: *{fmt_rub(s['ruble_balance'])}*  💵 *{fmt_usdt(s['usdt_balance'])}*",
+        parse_mode="Markdown")
 
 
 @dp.message(Command("reset"))
@@ -1344,18 +2028,36 @@ async def on_text(message: Message):
 
     if not parsed_items:
         low = message.text.lower().strip()
-        triggers = ("продал", "продала", "купил", "купила", "откупил",
-                    "выдал", "выдала", "выдали", "отдал", "отдали",
+        trade_triggers = ("продал", "продала", "продали", "купил", "купила",
+                          "купили", "откупил", "откупили")
+        cash_loan_triggers = ("выдал", "выдала", "выдали", "отдал", "отдали",
                     "принял", "приняла", "приняли", "забрал", "забрали",
                     "занял", "заняла", "заняли", "долг", "вернул",
-                    "вернула", "вернули", "погасил", "погасили")
-        if any(t in low for t in triggers):
+                    "вернула", "вернули", "погасил", "погасили", "дал")
+        has_number = bool(re.search(r"\d", low))
+        has_op = bool(re.search(r"[*x×/÷:]", low))
+
+        if any(t in low for t in trade_triggers):
+            # Сделка, но не распозналась
+            hint = "Не понял сделку. "
+            if not has_number:
+                hint += "Не вижу чисел.\n"
+            elif not has_op:
+                hint += "Похоже нет знака `*` или `/`.\n_`*` — слева USDT, `/` — слева рубли._\n"
+            else:
+                hint += "Проверь формат:\n"
             await message.reply(
-                "Не понял формат. Примеры:\n"
-                "`Продал Гиге 100*76`\n"
-                "`Купил у Васи 75000/74`\n"
+                hint +
+                "`Продал Гиге 100*76`  (100 USDT по 76)\n"
+                "`Купил у Васи 75000/74`  (на 75000₽ по 74)",
+                parse_mode="Markdown")
+        elif any(t in low for t in cash_loan_triggers):
+            await message.reply(
+                "Не понял операцию. Примеры:\n"
                 "`Выдал Владу 72600`\n"
-                "`Принял от Адахана 96000`",
+                "`Принял от Адахана 96000`\n"
+                "`Дал в долг Михаилу 90000`\n"
+                "`Михаил вернул 50000`",
                 parse_mode="Markdown")
         return
 
@@ -1522,11 +2224,38 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
             doer_str = f" ({p['doer']})" if p.get("doer") else ""
             d = get_debts(chat_id)
             debt_reminder = format_debt_status(d)
+
+            # Подсветка плохой сделки: сравниваем курс этой сделки со средними
+            # ДО неё (по текущему циклу). Если sell ниже средней закупки —
+            # продаём в убыток. Если buy выше средней продажи — закупаемся дороже,
+            # чем планируем продавать.
+            trade_warning = ""
+            prev_rates = get_avg_rates_excluding(chat_id, exclude_id=tid, period="cycle")
+            if t == "sell" and prev_rates["avg_buy"] is not None:
+                if p["rate"] < prev_rates["avg_buy"]:
+                    diff = prev_rates["avg_buy"] - p["rate"]
+                    loss = diff * p["usdt"]
+                    trade_warning = (
+                        f"\n\n⚠️ *Курс {fmt_rate(p['rate'])} ниже средней закупки "
+                        f"{fmt_rate(prev_rates['avg_buy'])} — продал в убыток*\n"
+                        f"   −{fmt_rate(diff)}₽/USDT  (≈ −{fmt_rub(loss)} на этой сделке)"
+                    )
+            elif t == "buy" and prev_rates["avg_sell"] is not None:
+                if p["rate"] > prev_rates["avg_sell"]:
+                    diff = p["rate"] - prev_rates["avg_sell"]
+                    loss = diff * p["usdt"]
+                    trade_warning = (
+                        f"\n\n⚠️ *Курс {fmt_rate(p['rate'])} выше средней продажи "
+                        f"{fmt_rate(prev_rates['avg_sell'])} — закупил дороже планируемой продажи*\n"
+                        f"   +{fmt_rate(diff)}₽/USDT  (≈ −{fmt_rub(loss)} закладываешь в убыток)"
+                    )
+
             await message.reply(
                 f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}\n"
                 f"   {fmt_usdt(p['usdt'])} × {fmt_rate(p['rate'])} = {fmt_rub(p['rubles'])}\n\n"
                 f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['rubles'])} = *{fmt_rub(final['ruble_balance'])}*\n"
                 f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
+                f"{trade_warning}"
                 f"{debt_reminder}",
                 parse_mode="Markdown")
         else:
@@ -1657,6 +2386,33 @@ async def on_confirm_button(cq: CallbackQuery):
         confirm_line = f"\n\n✅ *Подтверждено {n} операций* в {datetime.utcnow().strftime('%H:%M UTC')}"
     confirm_line += f"\n💰 Касса: *{fmt_rub(final['ruble_balance'])}*"
     confirm_line += f"\n💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
+
+    # Подсветка плохих сделок среди подтверждённых
+    bad_trades = []
+    for r in rows:
+        t = r["type"]
+        if t not in ("sell", "buy"):
+            continue
+        prev = get_avg_rates_excluding(chat_id, exclude_id=r["id"], period="cycle")
+        rate = r["rate"] or 0
+        usdt_amt = r["usdt"] or 0
+        if t == "sell" and prev["avg_buy"] is not None and rate < prev["avg_buy"]:
+            diff = prev["avg_buy"] - rate
+            loss = diff * usdt_amt
+            bad_trades.append(
+                f"⚠️ {fmt_id(r['id'])} продал по {fmt_rate(rate)} < ср. закупки "
+                f"{fmt_rate(prev['avg_buy'])} (≈ −{fmt_rub(loss)})"
+            )
+        elif t == "buy" and prev["avg_sell"] is not None and rate > prev["avg_sell"]:
+            diff = rate - prev["avg_sell"]
+            loss = diff * usdt_amt
+            bad_trades.append(
+                f"⚠️ {fmt_id(r['id'])} купил по {fmt_rate(rate)} > ср. продажи "
+                f"{fmt_rate(prev['avg_sell'])} (≈ −{fmt_rub(loss)})"
+            )
+    if bad_trades:
+        confirm_line += "\n\n" + "\n".join(bad_trades)
+
     debt_status = format_debt_status(get_debts(chat_id))
     if debt_status:
         confirm_line += debt_status
