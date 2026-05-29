@@ -1571,7 +1571,7 @@ HELP_MAIN = (
     "`Продал @vasya_crypto 1000*76` — бот сам ведёт по клиенту статистику.\n\n"
     "📊 *Команды:*\n"
     "/balance · /stats · /rates · /history · /cashflow\n"
-    "/debts · /debt · /client · /clients\n"
+    "/debts · /debt · /client · /clients · /ct\n"
     "/day · /week · /month _(отчёты за период)_\n"
     "/export · /backup _(выгрузка Excel и копия базы)_\n"
     "/reminders · /setpaydate _(автонапоминания)_\n"
@@ -2048,8 +2048,88 @@ async def on_clients(message: Message):
 
     lines.append("\n_Детали: `/client <имя>`_")
     lines.append("_Сортировка: `/clients spread` · `/clients частые`_")
+    lines.append("_Таблицей: `/ct`_")
 
     await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+def _fmt_money_short(n: float) -> str:
+    """Сжатое представление: 1.5M, 729k, 950."""
+    if n is None:
+        return "—"
+    n = float(n)
+    if abs(n) >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if abs(n) >= 1000:
+        return f"{int(round(n/1000))}k"
+    return str(int(round(n)))
+
+
+def _fmt_spread_short(s) -> str:
+    if s is None:
+        return "  —"
+    return f"+{s:.2f}" if s >= 0 else f"{s:.2f}"
+
+
+@dp.message(Command("ct"))
+@dp.message(Command("clients_table"))
+async def on_clients_table(message: Message):
+    """Таблица клиентов прямо в Telegram (моноширинная)."""
+    parts = message.text.split(maxsplit=1)
+    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    clients = get_all_clients(message.chat.id)
+    if not clients:
+        await message.answer("USDT-сделок с клиентами ещё не было.")
+        return
+
+    sort_label = "по обороту"
+    if arg in ("spread", "спред"):
+        clients = [c for c in clients if c["spread"] is not None]
+        clients.sort(key=lambda x: -(x["spread"] or 0))
+        sort_label = "по спреду"
+    elif arg in ("ops", "частые", "count"):
+        clients.sort(key=lambda x: -x["ops"])
+        sort_label = "по числу сделок"
+    elif arg in ("usdt",):
+        clients.sort(key=lambda x: -x["turnover_usdt"])
+        sort_label = "по USDT-обороту"
+
+    top = clients[:20]
+
+    # Колонки: №  Клиент(15)  Сд(3)  Оборот(7)  Спред(5)
+    header = f"{'№':<2}{'Клиент':<15} {'Сд':<3}{'Оборот':<7} {'Спред':<5}"
+    sep = "─" * 36
+    lines = [header, sep]
+    for i, c in enumerate(top, 1):
+        name = c["display_name"] or "—"
+        if len(name) > 14:
+            name = name[:13] + "…"
+        idx = f"{i:<2}"
+        lines.append(
+            f"{idx}{name:<15} {c['ops']:<3}"
+            f"{_fmt_money_short(c['turnover_rub']):<7} "
+            f"{_fmt_spread_short(c['spread'])}"
+        )
+
+    table = "```\n" + "\n".join(lines) + "\n```"
+
+    total_turnover = sum(c["turnover_rub"] for c in clients)
+    total_usdt = sum(c["turnover_usdt"] for c in clients)
+
+    footer = [
+        f"\n📊 *Таблица клиентов* ({len(clients)}) — {sort_label}",
+        table,
+        f"💰 Общий оборот: *{fmt_rub(total_turnover)}* / *{fmt_usdt(total_usdt)}*",
+    ]
+    if len(clients) > 20:
+        footer.append(f"_Показаны топ-20 из {len(clients)}_")
+    footer.append(
+        "\n_Сортировка:_ `/ct spread` · `/ct частые` · `/ct usdt`\n"
+        "_Полная Excel-таблица:_ `/export`"
+    )
+
+    await message.answer("\n".join(footer), parse_mode="Markdown")
 
 
 @dp.message(Command("day"))
