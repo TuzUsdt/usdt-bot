@@ -195,6 +195,22 @@ def init_db():
             );
         """)
 
+        # v5: колонки для напоминаний (бэкап, оплата Railway)
+        if version < 5:
+            existing = {r[1] for r in conn.execute("PRAGMA table_info(chat_settings)").fetchall()}
+            to_add = {
+                "reminders_on":        "INTEGER DEFAULT 0",   # 0/1 — включены ли напоминания
+                "last_backup_ts":      "TEXT",                # когда последний раз делали /backup
+                "last_backup_remind":  "TEXT",                # дата последнего напоминания о бэкапе (ГГГГ-ММ-ДД)
+                "pay_date":            "TEXT",                # дата оплаты Railway (ГГГГ-ММ-ДД)
+                "last_pay_remind":     "TEXT",                # дата последнего напоминания об оплате
+            }
+            for col, decl in to_add.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE chat_settings ADD COLUMN {col} {decl}")
+            conn.execute("PRAGMA user_version = 5")
+            log.info("Применил миграцию v5 (напоминания).")
+
 
 # ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
@@ -222,15 +238,19 @@ def get_chat_settings(chat_id: int) -> dict:
         row = conn.execute("SELECT * FROM chat_settings WHERE chat_id = ?", (chat_id,)).fetchone()
         if not row:
             conn.execute("INSERT INTO chat_settings (chat_id) VALUES (?)", (chat_id,))
-            return {"chat_id": chat_id, "chat_type": "main", "confirm_mode": "trades"}
+            return {"chat_id": chat_id, "chat_type": "main", "confirm_mode": "trades",
+                    "reminders_on": 0, "last_backup_ts": None, "last_backup_remind": None,
+                    "pay_date": None, "last_pay_remind": None}
         return dict(row)
 
 
 def set_chat_setting(chat_id: int, **kw):
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (chat_id,))
+        allowed = ("chat_type", "confirm_mode", "reminders_on",
+                   "last_backup_ts", "last_backup_remind", "pay_date", "last_pay_remind")
         for k, v in kw.items():
-            if k in ("chat_type", "confirm_mode"):
+            if k in allowed:
                 conn.execute(f"UPDATE chat_settings SET {k} = ? WHERE chat_id = ?", (v, chat_id))
 
 
@@ -1554,6 +1574,7 @@ HELP_MAIN = (
     "/debts · /debt · /client · /clients\n"
     "/day · /week · /month _(отчёты за период)_\n"
     "/export · /backup _(выгрузка Excel и копия базы)_\n"
+    "/reminders · /setpaydate _(автонапоминания)_\n"
     "/find · /undo · /pending · /setcash · /settype · /confirm · /help"
 )
 
@@ -2110,9 +2131,88 @@ async def on_backup(message: Message):
                 "_Делай бэкап раз в несколько дней или после большого объёма операций._"
             ),
             parse_mode="Markdown")
+        # Запоминаем момент бэкапа — чтобы напоминалка не дёргала зря
+        set_chat_setting(message.chat.id, last_backup_ts=datetime.now(LOCAL_TZ).isoformat())
     except Exception as e:
         log.exception("Ошибка бэкапа")
         await message.answer(f"Не удалось отправить базу: {e}")
+
+
+@dp.message(Command("reminders"))
+async def on_reminders(message: Message):
+    """Включить/выключить автонапоминания (бэкап + оплата Railway)."""
+    parts = message.text.split(maxsplit=1)
+    s = get_chat_settings(message.chat.id)
+    if len(parts) < 2:
+        status = "включены ✅" if s.get("reminders_on") else "выключены ❌"
+        pay = s.get("pay_date")
+        pay_line = f"\n💳 Дата оплаты Railway: *{pay}*" if pay else "\n💳 Дата оплаты Railway не задана (см. /setpaydate)"
+        last_bk = s.get("last_backup_ts")
+        bk_line = ""
+        if last_bk:
+            try:
+                d = datetime.fromisoformat(last_bk)
+                bk_line = f"\n💾 Последний бэкап: {d.strftime('%d.%m.%Y %H:%M')}"
+            except (ValueError, TypeError):
+                pass
+        await message.answer(
+            f"🔔 *Напоминания {status}*\n"
+            f"{pay_line}{bk_line}\n\n"
+            "Бот сам напомнит:\n"
+            "• 💾 сделать бэкап, если давно не делал (раз в ~4 дня)\n"
+            "• 💳 про оплату Railway за несколько дней до даты\n\n"
+            "Управление:\n"
+            "`/reminders on` — включить\n"
+            "`/reminders off` — выключить\n"
+            "`/setpaydate 21.06.2026` — задать дату оплаты Railway",
+            parse_mode="Markdown")
+        return
+    arg = parts[1].strip().lower()
+    if arg in ("on", "вкл", "включить"):
+        set_chat_setting(message.chat.id, reminders_on=1)
+        await message.answer(
+            "🔔 Напоминания включены.\n\n"
+            "Буду писать сюда про бэкапы и оплату Railway.\n"
+            "Чтобы я напоминал и про оплату — задай дату: `/setpaydate 21.06.2026`",
+            parse_mode="Markdown")
+    elif arg in ("off", "выкл", "выключить"):
+        set_chat_setting(message.chat.id, reminders_on=0)
+        await message.answer("🔕 Напоминания выключены.")
+    else:
+        await message.answer("Используй `/reminders on` или `/reminders off`.", parse_mode="Markdown")
+
+
+@dp.message(Command("setpaydate"))
+async def on_setpaydate(message: Message):
+    """Задать дату оплаты Railway: /setpaydate 21.06.2026"""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: `/setpaydate ДД.ММ.ГГГГ`\n"
+            "Например: `/setpaydate 21.06.2026`\n\n"
+            "Посмотреть дату можно в Railway вверху справа "
+            "(«24 days left» и т.п.). Прибавь это число дней к сегодня.",
+            parse_mode="Markdown")
+        return
+    raw = parts[1].strip()
+    # Принимаем ДД.ММ.ГГГГ или ГГГГ-ММ-ДД
+    parsed = None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y", "%d/%m/%Y"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    if not parsed:
+        await message.answer("Не понял дату. Пример: `/setpaydate 21.06.2026`", parse_mode="Markdown")
+        return
+    iso = parsed.strftime("%Y-%m-%d")
+    set_chat_setting(message.chat.id, pay_date=iso, reminders_on=1)
+    await message.answer(
+        f"💳 Дата оплаты Railway: *{parsed.strftime('%d.%m.%Y')}*\n"
+        "Напомню за 7, 3 и 1 день до неё (и в сам день).\n"
+        "_Напоминания заодно включил._",
+        parse_mode="Markdown")
 
 
 @dp.message(Command("pending"))
@@ -2756,9 +2856,151 @@ async def on_cancel_button(cq: CallbackQuery):
 
 
 # ────────────────── ЗАПУСК ──────────────────
+async def reminders_loop():
+    """
+    Фоновая задача: раз в час проверяет все чаты с включёнными напоминаниями
+    и шлёт сообщения о бэкапе и оплате Railway, если пришло время.
+
+    Тихие часы: не шлю с 22:00 до 09:00 по локальному времени.
+    Анти-спам: один тип напоминания — не чаще раза в сутки.
+    """
+    # Небольшая задержка чтобы бот успел стартануть
+    await asyncio.sleep(30)
+    log.info("Reminders loop started.")
+    while True:
+        try:
+            await _check_reminders_once()
+        except Exception:
+            log.exception("Reminders loop error")
+        # Раз в час
+        await asyncio.sleep(3600)
+
+
+async def _check_reminders_once():
+    now_local = datetime.now(LOCAL_TZ)
+    if now_local.hour < 9 or now_local.hour >= 22:
+        return  # тихие часы
+    today_str = now_local.strftime("%Y-%m-%d")
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chat_settings WHERE reminders_on = 1").fetchall()
+
+    for r in rows:
+        chat_id = r["chat_id"]
+        try:
+            await _maybe_remind_backup(chat_id, r, now_local, today_str)
+            await _maybe_remind_pay(chat_id, r, now_local, today_str)
+        except Exception:
+            log.exception(f"Reminder send error for chat {chat_id}")
+
+
+async def _maybe_remind_backup(chat_id: int, settings, now_local, today_str: str):
+    """Напоминание о бэкапе. Раз в 4 дня (по умолчанию), не чаще 1 в день."""
+    interval_days = 4
+    last_remind = settings["last_backup_remind"] if "last_backup_remind" in settings.keys() else None
+    if last_remind == today_str:
+        return  # уже напоминал сегодня
+
+    last_backup = settings["last_backup_ts"] if "last_backup_ts" in settings.keys() else None
+    days_since_backup = None
+    if last_backup:
+        try:
+            d = datetime.fromisoformat(last_backup)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=LOCAL_TZ)
+            days_since_backup = (now_local - d).days
+        except (ValueError, TypeError):
+            pass
+
+    # Если бэкапа не было совсем — напомним через 2 дня после включения reminders
+    # Если был — через interval_days
+    should_remind = False
+    if last_backup is None:
+        # Бэкап ещё ни разу не делали — напомним один раз
+        should_remind = True
+        text = (
+            "💾 *Напоминание о резервной копии*\n\n"
+            "Ты ещё ни разу не делал бэкап базы. Сейчас самое время:\n\n"
+            "Напиши `/backup` — я пришлю файл базы в чат. Просто сохрани его.\n\n"
+            "_Делай так раз в несколько дней — это защита от любых сюрпризов._"
+        )
+    elif days_since_backup is not None and days_since_backup >= interval_days:
+        should_remind = True
+        text = (
+            f"💾 *Напоминание о резервной копии*\n\n"
+            f"Последний бэкап был {days_since_backup} дн. назад. Пора обновить:\n\n"
+            f"Напиши `/backup` — я пришлю свежий файл базы."
+        )
+
+    if should_remind:
+        try:
+            await bot.send_message(chat_id, text, parse_mode="Markdown")
+            set_chat_setting(chat_id, last_backup_remind=today_str)
+            log.info(f"Sent backup reminder to {chat_id}")
+        except Exception:
+            log.exception(f"Failed to send backup reminder to {chat_id}")
+
+
+async def _maybe_remind_pay(chat_id: int, settings, now_local, today_str: str):
+    """Напоминание об оплате Railway. За 7, 3, 1 день и в день оплаты."""
+    pay_date = settings["pay_date"] if "pay_date" in settings.keys() else None
+    if not pay_date:
+        return
+    try:
+        pd = datetime.strptime(pay_date, "%Y-%m-%d")
+        pd_date = pd.date()
+    except ValueError:
+        return
+
+    today = now_local.date()
+    days_left = (pd_date - today).days
+
+    # Шлю в дни 7, 3, 1, 0, и если просрочено (-1, -2 ... до -7)
+    remind_at_days = (7, 3, 1, 0)
+    if days_left not in remind_at_days and not (-7 <= days_left < 0):
+        return
+
+    last_remind = settings["last_pay_remind"] if "last_pay_remind" in settings.keys() else None
+    if last_remind == today_str:
+        return
+
+    if days_left > 0:
+        text = (
+            f"💳 *Напоминание об оплате Railway*\n\n"
+            f"До окончания триала / оплаты осталось *{days_left} {'день' if days_left == 1 else 'дн.'}* "
+            f"({pd.strftime('%d.%m.%Y')}).\n\n"
+            "Чтобы бот не выключился — зайди на railway.com и привяжи карту "
+            "(или пополни баланс). Стоимость ≈ $5/мес.\n\n"
+            "После оплаты задай новую дату: `/setpaydate ДД.ММ.ГГГГ`"
+        )
+    elif days_left == 0:
+        text = (
+            "💳 *СЕГОДНЯ дата оплаты Railway!*\n\n"
+            "Если не оплатил — бот может выключиться в любой момент. "
+            "Срочно зайди на railway.com.\n\n"
+            "После оплаты задай новую дату: `/setpaydate ДД.ММ.ГГГГ`"
+        )
+    else:
+        text = (
+            f"⚠️ *Оплата Railway просрочена на {-days_left} дн.*\n\n"
+            "Если бот ещё работает — повезло, но в любой момент может встать. "
+            "Срочно оплати и задай новую дату: `/setpaydate ДД.ММ.ГГГГ`"
+        )
+
+    try:
+        await bot.send_message(chat_id, text, parse_mode="Markdown")
+        set_chat_setting(chat_id, last_pay_remind=today_str)
+        log.info(f"Sent pay reminder to {chat_id} (days_left={days_left})")
+    except Exception:
+        log.exception(f"Failed to send pay reminder to {chat_id}")
+
+
 async def main():
     init_db()
     log.info("Бот запущен. Жду сообщения…")
+    # Фоновая задача напоминаний
+    asyncio.create_task(reminders_loop())
     await dp.start_polling(bot)
 
 
