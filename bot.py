@@ -211,6 +211,14 @@ def init_db():
             conn.execute("PRAGMA user_version = 5")
             log.info("Применил миграцию v5 (напоминания).")
 
+        # v6: отдельный счётчик дохода с арбитража (не смешивается с кошельком)
+        if version < 6:
+            existing = {r[1] for r in conn.execute("PRAGMA table_info(state)").fetchall()}
+            if "arb_profit_usdt" not in existing:
+                conn.execute("ALTER TABLE state ADD COLUMN arb_profit_usdt REAL DEFAULT 0")
+            conn.execute("PRAGMA user_version = 6")
+            log.info("Применил миграцию v6 (отдельный счётчик арбитража).")
+
 
 # ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
@@ -218,17 +226,27 @@ def get_state(chat_id: int) -> dict:
         row = conn.execute("SELECT * FROM state WHERE chat_id = ?", (chat_id,)).fetchone()
         if not row:
             conn.execute("INSERT INTO state (chat_id) VALUES (?)", (chat_id,))
-            return {"ruble_balance": 0.0, "usdt_balance": 0.0, "extra_rubles": 0.0}
-        return dict(row)
+            return {"ruble_balance": 0.0, "usdt_balance": 0.0,
+                    "extra_rubles": 0.0, "arb_profit_usdt": 0.0}
+        d = dict(row)
+        d.setdefault("arb_profit_usdt", 0.0)
+        return d
 
 
-def update_state(chat_id: int, d_rubles: float = 0, d_usdt: float = 0):
+def update_state(chat_id: int, d_rubles: float = 0, d_usdt: float = 0,
+                 d_arb_profit: float = 0):
+    """
+    Обновить состояние. d_arb_profit меняет ТОЛЬКО отдельный счётчик
+    дохода с арбитража, не трогая кошелёк USDT и кассу.
+    """
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO state (chat_id) VALUES (?)", (chat_id,))
         conn.execute(
             "UPDATE state SET ruble_balance = ruble_balance + ?, "
-            "usdt_balance = usdt_balance + ? WHERE chat_id = ?",
-            (d_rubles, d_usdt, chat_id)
+            "usdt_balance = usdt_balance + ?, "
+            "arb_profit_usdt = COALESCE(arb_profit_usdt, 0) + ? "
+            "WHERE chat_id = ?",
+            (d_rubles, d_usdt, d_arb_profit, chat_id)
         )
 
 
@@ -1489,8 +1507,9 @@ def apply_balance(chat_id: int, tx_row) -> None:
     elif t == "cash_out":
         update_state(chat_id, d_rubles=-tx_row["rubles"])
     elif t == "arb":
-        # Касса не меняется, в кошелёк падает только разница (profit, лежит в поле usdt)
-        update_state(chat_id, d_usdt=tx_row["usdt"])
+        # Арбитраж НЕ трогает кассу и кошелёк USDT.
+        # Профит копится в отдельном счётчике "доход с арбитража".
+        update_state(chat_id, d_arb_profit=tx_row["usdt"])
     elif t == "loan_out":          # дали в долг → касса -
         update_state(chat_id, d_rubles=-tx_row["rubles"])
     elif t == "loan_in":           # заняли → касса +
@@ -1513,7 +1532,7 @@ def reverse_balance(chat_id: int, tx_row) -> None:
     elif t == "cash_out":
         update_state(chat_id, d_rubles=tx_row["rubles"])
     elif t == "arb":
-        update_state(chat_id, d_usdt=-tx_row["usdt"])
+        update_state(chat_id, d_arb_profit=-tx_row["usdt"])
     elif t == "loan_out":
         update_state(chat_id, d_rubles=tx_row["rubles"])
     elif t == "loan_in":
@@ -1681,6 +1700,9 @@ async def on_confirm_cmd(message: Message):
 async def on_balance(message: Message):
     s = get_state(message.chat.id)
     text = f"💰 *Касса:* {fmt_rub(s['ruble_balance'])}\n💵 *Кошелёк:* {fmt_usdt(s['usdt_balance'])}"
+    arb_total = s.get("arb_profit_usdt", 0) or 0
+    if arb_total:
+        text += f"\n💼 *Доход с арбитража:* {fmt_usdt(arb_total)}"
     if s["extra_rubles"]:
         text += f"\n♻️ *Лишние:* {fmt_rub(s['extra_rubles'])}"
     # Сколько pending
@@ -2563,7 +2585,7 @@ async def handle_arbitrage(message: Message, arb: dict, settings: dict):
         "",
         f"📥 От *{arb['partner_in']}*: +{fmt_usdt(arb['usdt_in'])} (по курсу {fmt_rate(arb['rate_in'])})",
         f"📤 К *{arb['partner_out']}*: −{fmt_usdt(arb['usdt_out'])} (по курсу {fmt_rate(arb['rate_out'])})",
-        f"💰 Через касу: {fmt_rub(arb['rub_amount'])} _(не зачисляется)_",
+        f"💰 Через кассу прошло: {fmt_rub(arb['rub_amount'])} _(но касса не меняется)_",
         "",
         f"💵 *Профит: +{fmt_usdt(arb['profit'])}*",
     ]
@@ -2578,7 +2600,13 @@ async def handle_arbitrage(message: Message, arb: dict, settings: dict):
             "rubles": 0,
         })
         final = get_state(chat_id)
-        lines.append(f"\n💵 Кошелёк: {fmt_usdt(initial['usdt_balance'])} +{fmt_usdt(arb['profit'])} = *{fmt_usdt(final['usdt_balance'])}*")
+        old_arb = initial.get("arb_profit_usdt", 0) or 0
+        new_arb = final.get("arb_profit_usdt", 0) or 0
+        lines.append(
+            f"\n📊 *Касса и кошелёк USDT не изменились.*\n"
+            f"💼 Доход с арбитража: {fmt_usdt(old_arb)} +{fmt_usdt(arb['profit'])} "
+            f"= *{fmt_usdt(new_arb)}*"
+        )
         debt_status = format_debt_status(get_debts(chat_id))
         if debt_status:
             lines.append(debt_status)
@@ -2857,6 +2885,9 @@ async def on_confirm_button(cq: CallbackQuery):
         confirm_line = f"\n\n✅ *Подтверждено {n} операций* в {datetime.utcnow().strftime('%H:%M UTC')}"
     confirm_line += f"\n💰 Касса: *{fmt_rub(final['ruble_balance'])}*"
     confirm_line += f"\n💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
+    arb_total = final.get("arb_profit_usdt", 0) or 0
+    if arb_total:
+        confirm_line += f"\n💼 Доход с арбитража: *{fmt_usdt(arb_total)}*"
 
     # Подсветка плохих сделок среди подтверждённых
     bad_trades = []
