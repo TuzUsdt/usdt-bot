@@ -1589,7 +1589,7 @@ HELP_MAIN = (
     "👤 *Клиенты:* пиши имя или @username в сделке —\n"
     "`Продал @vasya_crypto 1000*76` — бот сам ведёт по клиенту статистику.\n\n"
     "📊 *Команды:*\n"
-    "/balance · /stats · /rates · /history · /cashflow\n"
+    "/balance · /stats · /rates · /arb · /history · /cashflow\n"
     "/debts · /debt · /client · /clients · /ct\n"
     "/day · /week · /month _(отчёты за период)_\n"
     "/export · /backup _(выгрузка Excel и копия базы)_\n"
@@ -1615,9 +1615,11 @@ HELP_FIELD = (
 )
 
 HELP_COMMON = (
-    "👋 Это чат общей кассы.\n"
+    "👋 Это чат *общей кассы*.\n"
     "_Тип чата:_ *common* — приходы и расходы общего котла\n\n"
-    "💵 *Шаблоны:*\n"
+    "🔒 *Сделки и арбитраж здесь не ведутся* — только наличные движения. "
+    "Курсы и спреды видны только в твоём личном чате с ботом.\n\n"
+    "💵 *Что писать сюда:*\n"
     "`Принял от Влада 500 000` _(Влад сдал в кассу)_\n"
     "`Принял от Ивана 800 000` _(Иван внёс в кассу)_\n"
     "`Выдал Владу 100 000` _(касса → Владу на оборотку)_\n"
@@ -1626,7 +1628,7 @@ HELP_COMMON = (
     "`Дал в долг MTX 1 000 000`\n"
     "`MTX вернул 500 000`\n\n"
     "📊 *Команды:*\n"
-    "/balance · /cashflow · /rates · /debts · /client · /clients · /day · /week · /month · /export · /backup · /find · /undo · /history · /settype · /help"
+    "/balance · /cashflow · /debts · /day · /week · /month · /export · /backup · /find · /undo · /history · /settype · /help"
 )
 
 
@@ -2154,6 +2156,83 @@ async def on_clients_table(message: Message):
     await message.answer("\n".join(footer), parse_mode="Markdown")
 
 
+@dp.message(Command("arb"))
+async def on_arb(message: Message):
+    """Сводка по арбитражным сделкам и накопленному доходу."""
+    chat_id = message.chat.id
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND type = 'arb' "
+            "AND status = 'confirmed' ORDER BY id", (chat_id,)).fetchall()
+
+    state = get_state(chat_id)
+    arb_total = state.get("arb_profit_usdt", 0) or 0
+
+    if not rows:
+        await message.answer(
+            "🔄 *Арбитражных сделок ещё не было.*\n\n"
+            "Пиши их так:\n"
+            "```\nСделка без моих средств\n"
+            "Купил у Партнёра 100000/75\n"
+            "Продал Клиенту 100000/76\n```\n"
+            "Касса и USDT-кошелёк не изменятся — профит копится отдельно.",
+            parse_mode="Markdown")
+        return
+
+    n = len(rows)
+    profits = [r["usdt"] or 0 for r in rows]
+    total = sum(profits)
+    avg = total / n if n else 0
+    best = max(rows, key=lambda r: r["usdt"] or 0)
+    worst = min(rows, key=lambda r: r["usdt"] or 0)
+
+    # Считаем сегодня/неделя/месяц
+    now_local = datetime.now(LOCAL_TZ)
+    def in_period(ts_str, period):
+        try:
+            start_iso, end_iso, _ = _period_bounds(period)
+            return start_iso <= ts_str <= end_iso
+        except Exception:
+            return False
+    today_profit = sum(r["usdt"] or 0 for r in rows if in_period(r["ts"], "day"))
+    week_profit = sum(r["usdt"] or 0 for r in rows if in_period(r["ts"], "week"))
+    month_profit = sum(r["usdt"] or 0 for r in rows if in_period(r["ts"], "month"))
+
+    lines = [
+        "🔄 *Арбитраж — сводка*\n",
+        f"💼 Накоплено всего: *{fmt_usdt(arb_total)}*",
+        f"📊 Сделок: *{n}*",
+        f"📈 Средний профит: *{fmt_usdt(avg)}* за сделку",
+        "",
+        f"🏆 Лучшая: {fmt_id(best['id'])} {best['counterparty']} → +{fmt_usdt(best['usdt'])}",
+    ]
+    if n > 1 and worst["id"] != best["id"]:
+        lines.append(f"📉 Минимальная: {fmt_id(worst['id'])} {worst['counterparty']} → +{fmt_usdt(worst['usdt'])}")
+
+    lines.append("")
+    lines.append("📅 *По периодам:*")
+    if today_profit:
+        lines.append(f"   Сегодня: +{fmt_usdt(today_profit)}")
+    if week_profit:
+        lines.append(f"   Неделя: +{fmt_usdt(week_profit)}")
+    if month_profit:
+        lines.append(f"   Месяц: +{fmt_usdt(month_profit)}")
+    if not (today_profit or week_profit or month_profit):
+        lines.append(f"   _Свежих сделок не было — последние записаны раньше._")
+
+    # Последние 5 сделок
+    recent = rows[-5:]
+    if recent:
+        lines.append("")
+        lines.append("🕐 *Последние:*")
+        for r in recent:
+            lines.append(f"   {fmt_id(r['id'])} {r['counterparty']}: +{fmt_usdt(r['usdt'])}")
+
+    lines.append("\n_Касса и USDT-кошелёк арбитражем не трогаются._")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
 @dp.message(Command("day"))
 async def on_day(message: Message):
     agg = get_period_report(message.chat.id, "day")
@@ -2505,10 +2584,20 @@ async def on_extra(message: Message):
 async def on_text(message: Message):
     chat_id = message.chat.id
     settings = get_chat_settings(chat_id)
+    is_common = settings.get("chat_type") == "common"
 
     # 1. Сначала пробуем распознать арбитраж
     arb = parse_arbitrage_message(message.text)
     if arb:
+        if is_common:
+            await message.reply(
+                "🔒 В *общей кассе* арбитражные сделки не ведутся.\n\n"
+                "Здесь только приходы и расходы кассы:\n"
+                "`Принял от Влада 500 000`\n"
+                "`Выдал на расходы 30 000`\n\n"
+                "_Сделки и арбитраж пиши в своём личном чате с ботом._",
+                parse_mode="Markdown")
+            return
         await handle_arbitrage(message, arb, settings)
         return
 
@@ -2518,6 +2607,20 @@ async def on_text(message: Message):
         p = parse_message_line(line)
         if p:
             parsed_items.append((p, line.strip()))
+
+    # В общем чате блокируем USDT-сделки — Влад не должен видеть курсы
+    if is_common and parsed_items:
+        trade_items = [p for p, _ in parsed_items if p["type"] in ("sell", "buy")]
+        if trade_items:
+            await message.reply(
+                "🔒 В *общей кассе* USDT-сделки не записываются.\n\n"
+                "Здесь только движения наличных:\n"
+                "`Принял от Влада 500 000`\n"
+                "`Выдал на расходы 30 000`\n"
+                "`Дал в долг MTX 1 000 000`\n\n"
+                "_Купли-продажи USDT пиши в своём личном чате с ботом._",
+                parse_mode="Markdown")
+            return
 
     if not parsed_items:
         low = message.text.lower().strip()
@@ -2530,8 +2633,8 @@ async def on_text(message: Message):
         has_number = bool(re.search(r"\d", low))
         has_op = bool(re.search(r"[*x×/÷:]", low))
 
-        if any(t in low for t in trade_triggers):
-            # Сделка, но не распозналась
+        # В общей кассе подсказки про сделки не нужны
+        if any(t in low for t in trade_triggers) and not is_common:
             hint = "Не понял сделку. "
             if not has_number:
                 hint += "Не вижу чисел.\n"
