@@ -1707,6 +1707,7 @@ async def on_balance(message: Message):
         text += f"\n💼 *Доход с арбитража:* {fmt_usdt(arb_total)}"
     if s["extra_rubles"]:
         text += f"\n♻️ *Лишние:* {fmt_rub(s['extra_rubles'])}"
+
     # Сколько pending
     with db() as conn:
         pending = conn.execute(
@@ -1714,6 +1715,21 @@ async def on_balance(message: Message):
             (message.chat.id,)).fetchone()["c"]
     if pending:
         text += f"\n⏳ Не подтверждено: *{pending}* (см. /pending)"
+
+    # Чистый капитал с учётом долгов
+    debts = get_debts(message.chat.id)
+    owed_to_us = debts["total_owed_to_us"]
+    we_owe = debts["total_we_owe"]
+    if owed_to_us > 0.01 or we_owe > 0.01:
+        net_capital = s["ruble_balance"] + owed_to_us - we_owe
+        text += "\n\n📊 *С учётом долгов:*"
+        if owed_to_us > 0.01:
+            text += f"\n   📥 Нам должны: +{fmt_rub(owed_to_us)}"
+        if we_owe > 0.01:
+            text += f"\n   📤 Мы должны: −{fmt_rub(we_owe)}"
+        text += f"\n   ─────────────"
+        text += f"\n   💎 *Чистый капитал: {fmt_rub(net_capital)}*"
+        text += "\n   _Подробнее: /debts_"
 
     # Краткая сводка по курсам текущего цикла
     cycle = get_avg_rates(message.chat.id, period="cycle")
