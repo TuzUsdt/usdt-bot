@@ -219,6 +219,21 @@ def init_db():
             conn.execute("PRAGMA user_version = 6")
             log.info("Применил миграцию v6 (отдельный счётчик арбитража).")
 
+        # v7: валюта долга, личный карман, реферер
+        if version < 7:
+            existing = {r[1] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+            extra = {
+                "currency":      "TEXT DEFAULT 'rub'",
+                "from_personal": "INTEGER DEFAULT 0",
+                "ref_name":      "TEXT",
+                "ref_percent":   "REAL",
+            }
+            for col, decl in extra.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {decl}")
+            conn.execute("PRAGMA user_version = 7")
+            log.info("Применил миграцию v7 (валюта долгов, личный карман, рефералы).")
+
 
 # ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
@@ -275,16 +290,19 @@ def set_chat_setting(chat_id: int, **kw):
 # ───── Сохранение транзакций ─────
 def save_tx(chat_id, type_, counterparty, rubles, *, usdt=0, rate=0, raw="",
             doer=None, status="confirmed", batch_id=None,
-            usdt_in=0, usdt_out=0, partner_in=None, partner_out=None) -> int:
+            usdt_in=0, usdt_out=0, partner_in=None, partner_out=None,
+            currency="rub", from_personal=0, ref_name=None, ref_percent=None) -> int:
     with db() as conn:
         cur = conn.execute(
             "INSERT INTO transactions "
             "(chat_id, ts, type, counterparty, doer, usdt, rate, rubles, raw_text, "
-            " status, batch_id, usdt_in, usdt_out, partner_in, partner_out) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " status, batch_id, usdt_in, usdt_out, partner_in, partner_out, "
+            " currency, from_personal, ref_name, ref_percent) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (chat_id, datetime.utcnow().isoformat(), type_, counterparty, doer,
              usdt, rate, rubles, raw, status, batch_id,
-             usdt_in, usdt_out, partner_in, partner_out)
+             usdt_in, usdt_out, partner_in, partner_out,
+             currency, 1 if from_personal else 0, ref_name, ref_percent)
         )
         return cur.lastrowid
 
@@ -476,58 +494,81 @@ def name_root(name: str) -> str:
 
 def get_debts(chat_id: int) -> dict:
     """
-    Считает открытые долги по этому чату.
-    Имена группируются через name_root, чтобы «Михаил» и «Михаилу» считались
-    одним человеком.
+    Считает открытые долги по этому чату, раздельно по валютам.
 
     Возвращает {
-        "owed_to_us": [(name, amount), ...],
-        "we_owe":     [(name, amount), ...],
-        "total_owed_to_us": float,
-        "total_we_owe": float,
+        # ── Рубли (обратная совместимость — старые ключи) ──
+        "owed_to_us":           [(name, amount), ...],  # нам должны ₽
+        "we_owe":               [(name, amount), ...],  # мы должны ₽
+        "total_owed_to_us":     float,
+        "total_we_owe":         float,
+
+        # ── USDT ──
+        "owed_to_us_usdt":      [(name, amount), ...],
+        "we_owe_usdt":          [(name, amount), ...],
+        "total_owed_to_us_usdt": float,
+        "total_we_owe_usdt":    float,
     }
+
+    Имена группируются через name_root.
+    Личный карман (from_personal=1) тоже учитывается — долг всё равно
+    числится за человеком, просто касса/кошелёк не двигались.
     """
     with db() as conn:
-        # Все долговые транзакции
         all_loan_rows = conn.execute(
-            "SELECT id, type, counterparty, rubles FROM transactions "
+            "SELECT * FROM transactions "
             "WHERE chat_id = ? AND status = 'confirmed' "
             "AND type IN ('loan_out', 'loan_in', 'debt_repay_in', 'debt_repay_out') "
             "ORDER BY id",
             (chat_id,)).fetchall()
 
-    # Агрегируем по name_root
-    owed_acc = {}  # root → {"bal": float, "display_name": str}
-    we_owe_acc = {}
+    # acc[(currency, side)][root] = {bal, display_name}
+    # side: 'owed_to_us' | 'we_owe'
+    acc = {("rub","owed_to_us"): {}, ("rub","we_owe"): {},
+           ("usdt","owed_to_us"): {}, ("usdt","we_owe"): {}}
+
     for r in all_loan_rows:
         cp = r["counterparty"] or "—"
         root = name_root(cp)
-        if r["type"] == "loan_out":
-            d = owed_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
-            d["bal"] += r["rubles"]; d["display_name"] = cp
-        elif r["type"] == "debt_repay_in":
-            d = owed_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
-            d["bal"] -= r["rubles"]
-        elif r["type"] == "loan_in":
-            d = we_owe_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
-            d["bal"] += r["rubles"]; d["display_name"] = cp
-        elif r["type"] == "debt_repay_out":
-            d = we_owe_acc.setdefault(root, {"bal": 0.0, "display_name": cp})
-            d["bal"] -= r["rubles"]
+        cur = _tx_get(r, "currency", "rub") or "rub"
+        t = r["type"]
 
-    owed_to_us = [(v["display_name"], round(v["bal"], 2))
-                  for v in owed_acc.values() if v["bal"] > 0.01]
-    we_owe = [(v["display_name"], round(v["bal"], 2))
-              for v in we_owe_acc.values() if v["bal"] > 0.01]
+        if t == "loan_out":
+            key = (cur, "owed_to_us"); delta = +r["rubles"]
+        elif t == "debt_repay_in":
+            key = (cur, "owed_to_us"); delta = -r["rubles"]
+        elif t == "loan_in":
+            key = (cur, "we_owe"); delta = +r["rubles"]
+        elif t == "debt_repay_out":
+            key = (cur, "we_owe"); delta = -r["rubles"]
+        else:
+            continue
 
-    owed_to_us.sort(key=lambda x: -x[1])
-    we_owe.sort(key=lambda x: -x[1])
+        d = acc[key].setdefault(root, {"bal": 0.0, "display_name": cp})
+        d["bal"] += delta
+        if delta > 0:  # обновляем имя только при «увеличении» долга, не при возврате
+            d["display_name"] = cp
+
+    def collect(key):
+        return sorted(
+            [(v["display_name"], round(v["bal"], 2))
+             for v in acc[key].values() if v["bal"] > 0.01],
+            key=lambda x: -x[1])
+
+    owed_rub  = collect(("rub","owed_to_us"))
+    we_rub    = collect(("rub","we_owe"))
+    owed_usdt = collect(("usdt","owed_to_us"))
+    we_usdt   = collect(("usdt","we_owe"))
 
     return {
-        "owed_to_us":         owed_to_us,
-        "we_owe":             we_owe,
-        "total_owed_to_us":   sum(a for _, a in owed_to_us),
-        "total_we_owe":       sum(a for _, a in we_owe),
+        "owed_to_us":            owed_rub,
+        "we_owe":                we_rub,
+        "total_owed_to_us":      sum(a for _, a in owed_rub),
+        "total_we_owe":          sum(a for _, a in we_rub),
+        "owed_to_us_usdt":       owed_usdt,
+        "we_owe_usdt":           we_usdt,
+        "total_owed_to_us_usdt": sum(a for _, a in owed_usdt),
+        "total_we_owe_usdt":     sum(a for _, a in we_usdt),
     }
 
 
@@ -693,6 +734,81 @@ def get_all_clients(chat_id: int) -> list:
             "last_id": c["last_id"],
         })
     result.sort(key=lambda x: -x["turnover_rub"])
+    return result
+
+
+# ───── Рефералы ─────
+def get_referrer_balance(chat_id: int, name: str) -> dict:
+    """История и текущий баланс одного реферера. Группировка по name_root."""
+    target_root = name_root(name)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND type IN ('referral_accrued', 'referral_paid') "
+            "ORDER BY id", (chat_id,)).fetchall()
+
+    mine = [r for r in rows if name_root(r["counterparty"] or "") == target_root]
+    if not mine:
+        return None
+
+    name_counts = {}
+    for r in mine:
+        cp = r["counterparty"]
+        if cp:
+            name_counts[cp] = name_counts.get(cp, 0) + 1
+    display_name = max(name_counts, key=name_counts.get) if name_counts else name
+
+    accrued = sum(r["usdt"] or 0 for r in mine if r["type"] == "referral_accrued")
+    paid    = sum(r["usdt"] or 0 for r in mine if r["type"] == "referral_paid")
+    balance = accrued - paid
+
+    return {
+        "display_name": display_name,
+        "root":         target_root,
+        "accrued":      accrued,
+        "paid":         paid,
+        "balance":      balance,
+        "rows":         mine,
+        "count":        len(mine),
+    }
+
+
+def get_all_referrers(chat_id: int) -> list:
+    """Все рефереры этого чата, с балансами."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND type IN ('referral_accrued', 'referral_paid') "
+            "ORDER BY id", (chat_id,)).fetchall()
+
+    by_root = {}
+    for r in rows:
+        cp = r["counterparty"] or "—"
+        root = name_root(cp)
+        d = by_root.setdefault(root, {
+            "display_name": cp, "name_counts": {},
+            "accrued": 0.0, "paid": 0.0, "deals": 0,
+        })
+        d["name_counts"][cp] = d["name_counts"].get(cp, 0) + 1
+        if r["type"] == "referral_accrued":
+            d["accrued"] += r["usdt"] or 0
+            d["deals"] += 1
+        else:
+            d["paid"] += r["usdt"] or 0
+
+    result = []
+    for root, d in by_root.items():
+        display = max(d["name_counts"], key=d["name_counts"].get)
+        result.append({
+            "root":         root,
+            "display_name": display,
+            "accrued":      d["accrued"],
+            "paid":         d["paid"],
+            "balance":      d["accrued"] - d["paid"],
+            "deals":        d["deals"],
+        })
+    # Сортировка: сначала те у кого баланс > 0, потом по сумме начислений
+    result.sort(key=lambda x: (-1 if x["balance"] > 0.01 else 0, -x["accrued"]))
     return result
 
 
@@ -1118,6 +1234,25 @@ def _find_verb(lower: str, verb_groups: list) -> tuple:
 def parse_trade(text: str):
     """USDT-сделка. Возвращает dict или None."""
     text = text.strip().lstrip("+-—– ").strip()
+
+    # Вырезаем хвост с реферером: «… от Иван 0.1%» или «… от @vasya 0.5 %»
+    # Должен быть в самом конце, после основной сделки.
+    ref_name = None
+    ref_percent = None
+    m_ref = re.search(
+        r"\s+от\s+([^\s\d%]+(?:\s+[^\s\d%]+)?)\s+(\d+(?:[.,]\d+)?)\s*%\s*$",
+        text, re.IGNORECASE)
+    if m_ref:
+        ref_name = m_ref.group(1).strip()
+        try:
+            ref_percent = float(m_ref.group(2).replace(",", "."))
+        except ValueError:
+            ref_percent = None
+        if ref_percent is not None and 0 < ref_percent <= 100:
+            text = text[:m_ref.start()].strip()
+        else:
+            ref_name = ref_percent = None
+
     lower = text.lower()
 
     kind, vs, ve = _find_verb(lower, [("sell", SELL_VERBS), ("buy", BUY_VERBS)])
@@ -1157,6 +1292,8 @@ def parse_trade(text: str):
         "usdt": round(usdt, 4),
         "rate": rate,
         "rubles": round(rubles, 2),
+        "ref_name": ref_name,
+        "ref_percent": ref_percent,
     }
 
 
@@ -1225,19 +1362,70 @@ def parse_loan(text: str):
     """
     Долговые операции. Возвращает dict или None.
 
-    Шаблоны:
-      Дал в долг Михаилу 90000        → loan_out  (касса -, должник Михаил +)
-      Занял у Васи 200000             → loan_in   (касса +, кредитор Вася +)
-      Михаил вернул 50000             → debt_repay_in  (касса +, долг Михаила -)
-      Вернул Васе 100000              → debt_repay_out (касса -, наш долг Васе -)
+    Шаблоны (₽ — по умолчанию):
+      Дал в долг Михаилу 90000             → loan_out
+      Занял у Васи 200000                  → loan_in
+      Михаил вернул 50000                  → debt_repay_in
+      Вернул Васе 100000                   → debt_repay_out
+
+    USDT (символ $ или USDT/usdt после суммы):
+      Дал в долг Михаилу 500$              → loan_out USDT
+      Дал в долг Михаилу 500 USDT          → loan_out USDT
+      Занял у Васи 200 usdt                → loan_in USDT
+      Михаил вернул 100$                   → debt_repay_in USDT
+
+    Личный карман (касса/кошелёк не трогаются):
+      Дал в долг Михаилу 50000 с личных
+      Дал в долг Михаилу 500$ из кармана
+      ... любое из: «с личных», «из личных», «личные», «из кармана», «не из кассы»
     """
     t = text.strip().lstrip("+-—– ").strip()
-    lower = t.lower()
+
+    # 1. Отделяем «с личных»
+    from_personal = False
+    m = re.search(
+        r"\s+(с\s+личных|из\s+личных|личные|из\s+кармана|не\s+из\s+кассы)\s*$",
+        t, re.IGNORECASE)
+    if m:
+        from_personal = True
+        t = t[:m.start()].strip()
+
+    # 2. Универсальная функция: определить валюту и очистить строку
+    def split_currency(s):
+        """Возвращает (clean_text, currency). currency='usdt' если есть $/USDT, иначе 'rub'."""
+        # $ или USDT прямо после числа в конце (с пробелом или без): «500$», «500 $», «500 USDT», «500usdt»
+        m_usdt = re.search(
+            r"(\d[\d\s\u00a0.,]*\d|\d)\s*(\$|usdt|usd|долл(?:ар(?:ов|а)?)?)\s*₽?\s*$",
+            s, re.IGNORECASE)
+        if m_usdt:
+            # Оставляем число, режем валютный суффикс
+            cleaned = s[:m_usdt.end(1)] + s[m_usdt.end():]
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned, "usdt"
+        # $ перед числом: «$500»
+        m_pre = re.search(r"\$\s*(\d[\d\s\u00a0.,]*\d|\d)\s*$", s)
+        if m_pre:
+            cleaned = s[:m_pre.start()] + m_pre.group(1)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned, "usdt"
+        return s, "rub"
+
+    t_clean, currency = split_currency(t)
+
+    def build(type_, counterparty, amount):
+        return {
+            "type": type_,
+            "counterparty": counterparty.strip(),
+            "amount": amount,
+            "doer": None,
+            "currency": currency,
+            "from_personal": from_personal,
+        }
 
     # Дал в долг X сумма
     m = re.match(
-        r"^(?:дал|дала|дали|выдал|выдала|выдали|занял\s+(?!у\b))\s+в\s+долг\s+(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
-        t, re.IGNORECASE)
+        r"^(?:дал|дала|дали|выдал|выдала|выдали|одолжил|одолжила|одолжили|занял\s+(?!у\b))\s+в\s+долг\s+(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
+        t_clean, re.IGNORECASE)
     if m:
         try:
             amt = parse_number(m.group(2))
@@ -1245,13 +1433,25 @@ def parse_loan(text: str):
             return None
         if amt <= 0:
             return None
-        return {"type": "loan_out", "counterparty": m.group(1).strip(),
-                "amount": amt, "doer": None}
+        return build("loan_out", m.group(1), amt)
 
-    # Занял у X сумма (без "в долг")
+    # Одолжил X сумма (без «в долг»)
+    m = re.match(
+        r"^(?:одолжил|одолжила|одолжили)\s+(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
+        t_clean, re.IGNORECASE)
+    if m:
+        try:
+            amt = parse_number(m.group(2))
+        except ValueError:
+            return None
+        if amt <= 0:
+            return None
+        return build("loan_out", m.group(1), amt)
+
+    # Занял у X сумма
     m = re.match(
         r"^(?:занял|заняла|заняли|взял\s+в\s+долг|взяли\s+в\s+долг)\s+(?:у\s+)?(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
-        t, re.IGNORECASE)
+        t_clean, re.IGNORECASE)
     if m:
         try:
             amt = parse_number(m.group(2))
@@ -1259,14 +1459,13 @@ def parse_loan(text: str):
             return None
         if amt <= 0:
             return None
-        return {"type": "loan_in", "counterparty": m.group(1).strip(),
-                "amount": amt, "doer": None}
+        return build("loan_in", m.group(1), amt)
 
     # X вернул [нам] сумма
     m = re.match(
         r"^(.+?)\s+(?:вернул|вернула|вернули|отдал|отдала|отдали|погасил|погасила|погасили)"
         r"(?:\s+(?:нам|мне|долг))?\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
-        t, re.IGNORECASE)
+        t_clean, re.IGNORECASE)
     if m:
         try:
             amt = parse_number(m.group(2))
@@ -1274,14 +1473,13 @@ def parse_loan(text: str):
             return None
         if amt <= 0:
             return None
-        return {"type": "debt_repay_in", "counterparty": m.group(1).strip(),
-                "amount": amt, "doer": None}
+        return build("debt_repay_in", m.group(1), amt)
 
-    # Вернул/Отдал X сумма (мы отдаём свой долг)
+    # Вернул/Отдал долг X сумма
     m = re.match(
         r"^(?:вернул|вернула|вернули|отдал\s+долг|отдала\s+долг|отдали\s+долг|погасил|погасила|погасили)"
         r"\s+(.+?)\s+(" + NUM_PATTERN + r")\s*₽?\s*$",
-        t, re.IGNORECASE)
+        t_clean, re.IGNORECASE)
     if m:
         try:
             amt = parse_number(m.group(2))
@@ -1289,8 +1487,7 @@ def parse_loan(text: str):
             return None
         if amt <= 0:
             return None
-        return {"type": "debt_repay_out", "counterparty": m.group(1).strip(),
-                "amount": amt, "doer": None}
+        return build("debt_repay_out", m.group(1), amt)
 
     return None
 
@@ -1495,9 +1692,25 @@ def fmt_tx_short(r) -> str:
 
 
 # ────────────────── ЛОГИКА ПРИМЕНЕНИЯ БАЛАНСА ──────────────────
+def _tx_get(tx_row, field, default=None):
+    """Безопасно достаёт поле из tx_row (sqlite Row или dict)."""
+    try:
+        if hasattr(tx_row, "keys"):
+            if field in tx_row.keys():
+                v = tx_row[field]
+                return v if v is not None else default
+            return default
+        return tx_row.get(field, default)
+    except (KeyError, TypeError):
+        return default
+
+
 def apply_balance(chat_id: int, tx_row) -> None:
     """Применяет влияние подтверждённой транзакции на кассу/кошелёк."""
     t = tx_row["type"]
+    currency = _tx_get(tx_row, "currency", "rub") or "rub"
+    from_personal = bool(_tx_get(tx_row, "from_personal", 0))
+
     if t == "sell":
         update_state(chat_id, d_rubles=tx_row["rubles"], d_usdt=-tx_row["usdt"])
     elif t == "buy":
@@ -1510,19 +1723,32 @@ def apply_balance(chat_id: int, tx_row) -> None:
         # Арбитраж НЕ трогает кассу и кошелёк USDT.
         # Профит копится в отдельном счётчике "доход с арбитража".
         update_state(chat_id, d_arb_profit=tx_row["usdt"])
-    elif t == "loan_out":          # дали в долг → касса -
-        update_state(chat_id, d_rubles=-tx_row["rubles"])
-    elif t == "loan_in":           # заняли → касса +
-        update_state(chat_id, d_rubles=tx_row["rubles"])
-    elif t == "debt_repay_in":     # нам вернули → касса +
-        update_state(chat_id, d_rubles=tx_row["rubles"])
-    elif t == "debt_repay_out":    # мы вернули → касса -
-        update_state(chat_id, d_rubles=-tx_row["rubles"])
+    elif t in ("loan_out", "loan_in", "debt_repay_in", "debt_repay_out"):
+        # Долги: если from_personal — кассу/кошелёк не трогаем (только фиксируем долг)
+        if from_personal:
+            return
+        # Определяем знак изменения баланса:
+        # loan_out / debt_repay_out — деньги уходят (-), loan_in / debt_repay_in — приходят (+)
+        sign = -1 if t in ("loan_out", "debt_repay_out") else +1
+        amount = tx_row["rubles"]
+        if currency == "usdt":
+            update_state(chat_id, d_usdt=sign * amount)
+        else:
+            update_state(chat_id, d_rubles=sign * amount)
+    elif t == "referral_accrued":
+        # Бонус начислен реферу. Кошелёк не трогаем (это обязательство, копится отдельно).
+        pass
+    elif t == "referral_paid":
+        # Реально выплатили USDT реферу из кошелька.
+        update_state(chat_id, d_usdt=-tx_row["usdt"])
 
 
 def reverse_balance(chat_id: int, tx_row) -> None:
     """Откатывает влияние транзакции."""
     t = tx_row["type"]
+    currency = _tx_get(tx_row, "currency", "rub") or "rub"
+    from_personal = bool(_tx_get(tx_row, "from_personal", 0))
+
     if t == "sell":
         update_state(chat_id, d_rubles=-tx_row["rubles"], d_usdt=tx_row["usdt"])
     elif t == "buy":
@@ -1533,14 +1759,19 @@ def reverse_balance(chat_id: int, tx_row) -> None:
         update_state(chat_id, d_rubles=tx_row["rubles"])
     elif t == "arb":
         update_state(chat_id, d_arb_profit=-tx_row["usdt"])
-    elif t == "loan_out":
-        update_state(chat_id, d_rubles=tx_row["rubles"])
-    elif t == "loan_in":
-        update_state(chat_id, d_rubles=-tx_row["rubles"])
-    elif t == "debt_repay_in":
-        update_state(chat_id, d_rubles=-tx_row["rubles"])
-    elif t == "debt_repay_out":
-        update_state(chat_id, d_rubles=tx_row["rubles"])
+    elif t in ("loan_out", "loan_in", "debt_repay_in", "debt_repay_out"):
+        if from_personal:
+            return
+        sign = -1 if t in ("loan_out", "debt_repay_out") else +1
+        amount = tx_row["rubles"]
+        if currency == "usdt":
+            update_state(chat_id, d_usdt=-sign * amount)
+        else:
+            update_state(chat_id, d_rubles=-sign * amount)
+    elif t == "referral_accrued":
+        pass
+    elif t == "referral_paid":
+        update_state(chat_id, d_usdt=tx_row["usdt"])
 
 
 def should_confirm(parsed: dict, settings: dict) -> bool:
@@ -1579,9 +1810,14 @@ HELP_MAIN = (
     "`+ 96000 от клиента`\n\n"
     "💳 *Долги:*\n"
     "`Дал в долг Михаилу 90000`\n"
+    "`Дал в долг Михаилу 500$` _(долг в USDT)_\n"
+    "`Дал в долг Михаилу 50000 с личных` _(не из кассы)_\n"
     "`Занял у Васи 200000`\n"
     "`Михаил вернул 50000`\n"
     "`Вернул Васе 100000`\n\n"
+    "🤝 *Рефералы:*\n"
+    "`Продал Гиге 90000/76 от Ивана 0.1%`\n"
+    "_(Иван получит 0.1% от USDT-суммы сделки на реф.баланс)_\n\n"
     "🔄 *Арбитраж* (касса не меняется, в кошелёк падает спред):\n"
     "```\nСделка без моих средств\n"
     "Купил у Германа 196500/75=2620\n"
@@ -1591,6 +1827,7 @@ HELP_MAIN = (
     "📊 *Команды:*\n"
     "/balance · /stats · /rates · /arb · /history · /cashflow\n"
     "/debts · /debt · /client · /clients · /ct\n"
+    "/refs · /ref · /pay_ref _(рефералка)_\n"
     "/day · /week · /month _(отчёты за период)_\n"
     "/export · /backup _(выгрузка Excel и копия базы)_\n"
     "/reminders · /setpaydate _(автонапоминания)_\n"
@@ -1907,34 +2144,53 @@ async def on_cashflow(message: Message):
 @dp.message(Command("debts"))
 async def on_debts(message: Message):
     d = get_debts(message.chat.id)
-    lines = ["💳 *Долги*\n"]
+    lines = ["💳 *Долги*"]
 
-    if d["owed_to_us"]:
-        lines.append(f"📥 *Нам должны:* {fmt_rub(d['total_owed_to_us'])}")
-        for name, amt in d["owed_to_us"]:
-            lines.append(f"   • {name}: {fmt_rub(amt)}")
-    else:
-        lines.append("📥 *Нам никто не должен.*")
+    has_rub = bool(d["owed_to_us"] or d["we_owe"])
+    has_usdt = bool(d["owed_to_us_usdt"] or d["we_owe_usdt"])
 
-    lines.append("")
+    if not has_rub and not has_usdt:
+        lines.append("\nДолгов нет.")
+        await message.answer("\n".join(lines), parse_mode="Markdown")
+        return
 
-    if d["we_owe"]:
-        lines.append(f"📤 *Мы должны:* {fmt_rub(d['total_we_owe'])}")
-        for name, amt in d["we_owe"]:
-            lines.append(f"   • {name}: {fmt_rub(amt)}")
-    else:
-        lines.append("📤 *Мы никому не должны.*")
+    # ── Рубли ──
+    if has_rub:
+        lines.append("\n🇷🇺 *В рублях:*")
+        if d["owed_to_us"]:
+            lines.append(f"   📥 Нам должны: *{fmt_rub(d['total_owed_to_us'])}*")
+            for name, amt in d["owed_to_us"]:
+                lines.append(f"      • {name}: {fmt_rub(amt)}")
+        if d["we_owe"]:
+            lines.append(f"   📤 Мы должны: *{fmt_rub(d['total_we_owe'])}*")
+            for name, amt in d["we_owe"]:
+                lines.append(f"      • {name}: {fmt_rub(amt)}")
+        net_rub = d["total_owed_to_us"] - d["total_we_owe"]
+        if net_rub > 0:
+            lines.append(f"   📊 Чистый: +{fmt_rub(net_rub)}")
+        elif net_rub < 0:
+            lines.append(f"   📊 Чистый: −{fmt_rub(abs(net_rub))}")
 
-    net = d["total_owed_to_us"] - d["total_we_owe"]
-    lines.append("")
-    if net > 0:
-        lines.append(f"📊 *Чистый баланс: +{fmt_rub(net)}* (нам должны больше, чем мы)")
-    elif net < 0:
-        lines.append(f"📊 *Чистый баланс: −{fmt_rub(abs(net))}* (мы должны больше, чем нам)")
-    else:
-        lines.append("📊 *Чистый баланс: 0*")
+    # ── USDT ──
+    if has_usdt:
+        lines.append("\n💵 *В USDT:*")
+        if d["owed_to_us_usdt"]:
+            lines.append(f"   📥 Нам должны: *{fmt_usdt(d['total_owed_to_us_usdt'])}*")
+            for name, amt in d["owed_to_us_usdt"]:
+                lines.append(f"      • {name}: {fmt_usdt(amt)}")
+        if d["we_owe_usdt"]:
+            lines.append(f"   📤 Мы должны: *{fmt_usdt(d['total_we_owe_usdt'])}*")
+            for name, amt in d["we_owe_usdt"]:
+                lines.append(f"      • {name}: {fmt_usdt(amt)}")
+        net_usdt = d["total_owed_to_us_usdt"] - d["total_we_owe_usdt"]
+        if net_usdt > 0:
+            lines.append(f"   📊 Чистый: +{fmt_usdt(net_usdt)}")
+        elif net_usdt < 0:
+            lines.append(f"   📊 Чистый: −{fmt_usdt(abs(net_usdt))}")
 
-    lines.append("\nДеталь по человеку: `/debt <имя>`")
+    lines.append("\n_Деталь по человеку:_ `/debt <имя>`")
+    lines.append("_В долг в USDT:_ `Дал в долг Михаилу 500$`")
+    lines.append("_Из личного кармана:_ дописать ` с личных` в конце")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -2246,6 +2502,159 @@ async def on_arb(message: Message):
 
     lines.append("\n_Касса и USDT-кошелёк арбитражем не трогаются._")
 
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("refs"))
+async def on_refs(message: Message):
+    """Список всех рефереров с балансами."""
+    refs = get_all_referrers(message.chat.id)
+    if not refs:
+        await message.answer(
+            "🤝 *Рефералов пока нет.*\n\n"
+            "Чтобы начислить бонус — указывай реферера в сделке:\n"
+            "`Продал Гиге 90000/76 от Ивана 0.1%`\n\n"
+            "Бот посчитает: 90000/76 = 1184.21 USDT × 0.1% = 1.18 USDT\n"
+            "и зачислит Ивану на реф.баланс.",
+            parse_mode="Markdown")
+        return
+
+    open_bal = sum(r["balance"] for r in refs if r["balance"] > 0.01)
+    total_accrued = sum(r["accrued"] for r in refs)
+    total_paid = sum(r["paid"] for r in refs)
+
+    lines = ["🤝 *Реферальная программа*", ""]
+    lines.append(f"💼 Открытые обязательства: *{fmt_usdt(open_bal)}*")
+    lines.append(f"📊 Всего начислено: {fmt_usdt(total_accrued)}")
+    lines.append(f"💸 Всего выплачено: {fmt_usdt(total_paid)}")
+    lines.append("")
+
+    # Сначала те у кого баланс > 0
+    open_refs = [r for r in refs if r["balance"] > 0.01]
+    closed_refs = [r for r in refs if r["balance"] <= 0.01]
+
+    if open_refs:
+        lines.append("🟢 *Открытые:*")
+        for r in open_refs:
+            lines.append(
+                f"   • *{r['display_name']}*: {fmt_usdt(r['balance'])} "
+                f"_(нач. {fmt_usdt(r['accrued'])}, выпл. {fmt_usdt(r['paid'])})_"
+            )
+
+    if closed_refs:
+        lines.append("\n✅ *Закрытые* (нет долга):")
+        for r in closed_refs:
+            lines.append(
+                f"   • {r['display_name']}: всего {fmt_usdt(r['accrued'])} "
+                f"_(выплачено полностью)_"
+            )
+
+    lines.append("\n_Детали:_ `/ref <имя>`")
+    lines.append("_Выплатить:_ `/pay_ref <имя> <сумма>`")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("ref"))
+async def on_ref(message: Message):
+    """История по одному рефереру."""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: `/ref <имя>`\n"
+            "Например: `/ref Иван`",
+            parse_mode="Markdown")
+        return
+    name = parts[1].strip()
+    r = get_referrer_balance(message.chat.id, name)
+    if not r:
+        await message.answer(f"По «{name}» реферальных операций нет.")
+        return
+
+    lines = [
+        f"🤝 *{r['display_name']}* — {r['count']} операций",
+        "",
+        f"📊 Начислено: *{fmt_usdt(r['accrued'])}*",
+        f"💸 Выплачено: *{fmt_usdt(r['paid'])}*",
+        f"💼 Баланс: *{fmt_usdt(r['balance'])}*",
+        "",
+        "*История:*",
+    ]
+    for row in r["rows"]:
+        if row["type"] == "referral_accrued":
+            pct = _tx_get(row, "ref_percent")
+            pct_str = f" ({pct}%)" if pct else ""
+            lines.append(f"   {fmt_id(row['id'])} 📥 +{fmt_usdt(row['usdt'])}{pct_str}")
+        else:
+            lines.append(f"   {fmt_id(row['id'])} 💸 −{fmt_usdt(row['usdt'])} _(выплата)_")
+
+    if r["balance"] > 0.01:
+        lines.append(f"\n_Выплатить: `/pay_ref {r['display_name']} {r['balance']:.2f}`_")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("pay_ref"))
+async def on_pay_ref(message: Message):
+    """Выплата рефералу. /pay_ref <имя> <сумма>"""
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Использование: `/pay_ref <имя> <сумма USDT>`\n"
+            "Например: `/pay_ref Иван 5.50`\n\n"
+            "_Снимет указанную сумму с реф.баланса и из твоего USDT-кошелька._",
+            parse_mode="Markdown")
+        return
+
+    name = parts[1].strip()
+    try:
+        amount = float(parts[2].replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await message.answer("Не понял сумму. Пример: `/pay_ref Иван 5.50`",
+                             parse_mode="Markdown")
+        return
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+
+    r = get_referrer_balance(message.chat.id, name)
+    if not r:
+        await message.answer(f"Рефер «{name}» не найден.")
+        return
+
+    if amount > r["balance"] + 0.01:
+        await message.answer(
+            f"⚠️ Реф.баланс *{r['display_name']}* — *{fmt_usdt(r['balance'])}*, "
+            f"ты пытаешься выплатить *{fmt_usdt(amount)}*.\n\n"
+            "Не выплачиваю больше чем накопилось. Уменьши сумму или сначала запиши новые сделки.",
+            parse_mode="Markdown")
+        return
+
+    state_before = get_state(message.chat.id)
+    if amount > state_before["usdt_balance"] + 0.01:
+        await message.answer(
+            f"⚠️ В USDT-кошельке только *{fmt_usdt(state_before['usdt_balance'])}*, "
+            f"а ты хочешь выплатить *{fmt_usdt(amount)}*.\n\n"
+            "Сначала пополни USDT (купи у партнёра / продай рубли).",
+            parse_mode="Markdown")
+        return
+
+    # Записываем выплату
+    tid = save_tx(message.chat.id, "referral_paid", r["display_name"], 0,
+                  usdt=amount, raw=f"/pay_ref {amount}",
+                  status="confirmed")
+    apply_balance(message.chat.id, {"type": "referral_paid",
+                                    "usdt": amount, "rubles": 0})
+
+    state_after = get_state(message.chat.id)
+    new_ref = get_referrer_balance(message.chat.id, r["display_name"])
+
+    lines = [
+        f"{fmt_id(tid)} ✅ *Выплачено {r['display_name']}*: −{fmt_usdt(amount)}",
+        "",
+        f"💵 Кошелёк USDT: {fmt_usdt(state_before['usdt_balance'])} − {fmt_usdt(amount)} = *{fmt_usdt(state_after['usdt_balance'])}*",
+        f"🤝 Реф.баланс *{r['display_name']}*: *{fmt_usdt(new_ref['balance'])}*",
+    ]
+    if new_ref["balance"] < 0.01:
+        lines.append("\n✅ Расчёты с этим реферером закрыты.")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -2750,10 +3159,14 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
             cp = p["counterparty"]
             if t in ("sell", "buy"):
                 tid = save_tx(chat_id, t, cp, p["rubles"], usdt=p["usdt"], rate=p["rate"],
-                              raw=raw, doer=p.get("doer"), status="pending")
+                              raw=raw, doer=p.get("doer"), status="pending",
+                              ref_name=p.get("ref_name"),
+                              ref_percent=p.get("ref_percent"))
             else:
                 tid = save_tx(chat_id, t, cp, p["amount"],
-                              raw=raw, doer=p.get("doer"), status="pending")
+                              raw=raw, doer=p.get("doer"), status="pending",
+                              currency=p.get("currency", "rub"),
+                              from_personal=p.get("from_personal", 0))
             if first_id is None:
                 first_id = tid
             saved.append((tid, p))
@@ -2823,12 +3236,33 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
         cp = p["counterparty"]
         if t in ("sell", "buy"):
             tid = save_tx(chat_id, t, cp, p["rubles"], usdt=p["usdt"], rate=p["rate"],
-                          raw=raw, doer=p.get("doer"), status="confirmed")
+                          raw=raw, doer=p.get("doer"), status="confirmed",
+                          ref_name=p.get("ref_name"),
+                          ref_percent=p.get("ref_percent"))
             apply_balance(chat_id, {"type": t, "usdt": p["usdt"], "rubles": p["rubles"]})
+            # Реферальное начисление, если есть
+            if p.get("ref_name") and p.get("ref_percent"):
+                bonus = round(p["usdt"] * p["ref_percent"] / 100.0, 4)
+                if bonus > 0:
+                    ref_tid = save_tx(chat_id, "referral_accrued", p["ref_name"], 0,
+                                      usdt=bonus, raw=f"ref от #{tid:03d}",
+                                      status="confirmed",
+                                      ref_percent=p["ref_percent"])
+                    apply_balance(chat_id, {"type": "referral_accrued",
+                                            "usdt": bonus, "rubles": 0})
+                    p["_ref_bonus"] = bonus
+                    p["_ref_tid"] = ref_tid
         else:
+            # cash / долги: передаём валюту и личный карман, если есть
             tid = save_tx(chat_id, t, cp, p["amount"],
-                          raw=raw, doer=p.get("doer"), status="confirmed")
-            apply_balance(chat_id, {"type": t, "usdt": 0, "rubles": p["amount"]})
+                          raw=raw, doer=p.get("doer"), status="confirmed",
+                          currency=p.get("currency", "rub"),
+                          from_personal=p.get("from_personal", 0))
+            apply_balance(chat_id, {
+                "type": t, "usdt": 0, "rubles": p["amount"],
+                "currency": p.get("currency", "rub"),
+                "from_personal": p.get("from_personal", 0),
+            })
         saved.append((tid, p))
 
     final = get_state(chat_id)
@@ -2868,12 +3302,23 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
                         f"   +{fmt_rate(diff)}₽/USDT  (≈ −{fmt_rub(loss)} закладываешь в убыток)"
                     )
 
+            # Реферальный бонус (если был начислен)
+            ref_info = ""
+            if p.get("_ref_bonus"):
+                ref_data = get_referrer_balance(chat_id, p["ref_name"])
+                ref_balance = ref_data["balance"] if ref_data else p["_ref_bonus"]
+                ref_info = (
+                    f"\n\n🤝 Начислено *{p['ref_name']}*: +{fmt_usdt(p['_ref_bonus'])} "
+                    f"({p['ref_percent']}%, баланс: {fmt_usdt(ref_balance)})"
+                )
+
             await message.reply(
                 f"{fmt_id(tid)} ✅ {verb} *{p['counterparty']}*{doer_str}\n"
                 f"   {fmt_usdt(p['usdt'])} × {fmt_rate(p['rate'])} = {fmt_rub(p['rubles'])}\n\n"
                 f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['rubles'])} = *{fmt_rub(final['ruble_balance'])}*\n"
                 f"💵 Кошелёк: *{fmt_usdt(final['usdt_balance'])}*"
                 f"{trade_warning}"
+                f"{ref_info}"
                 f"{debt_reminder}",
                 parse_mode="Markdown")
         else:
@@ -2900,14 +3345,34 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
                 op_sign = "+" if t == "cash_in" else "−"
                 sign = op_sign
 
-            reply_lines = [
-                f"{fmt_id(tid)} ✅ {verb_full}",
-                f"   {sign}{fmt_rub(p['amount'])}",
-                "",
-                f"💰 Касса: {fmt_rub(initial['ruble_balance'])} {op_sign} {fmt_rub(p['amount'])} = *{fmt_rub(final['ruble_balance'])}*",
-            ]
+            reply_lines = [f"{fmt_id(tid)} ✅ {verb_full}"]
+            is_loan = t in ("loan_out", "loan_in", "debt_repay_in", "debt_repay_out")
+            currency = p.get("currency", "rub") if is_loan else "rub"
+            from_personal = p.get("from_personal", False) if is_loan else False
+
+            # Сумма с правильной валютой
+            if currency == "usdt":
+                reply_lines.append(f"   {sign}{fmt_usdt(p['amount'])}")
+            else:
+                reply_lines.append(f"   {sign}{fmt_rub(p['amount'])}")
+
+            # Что произошло с балансом
+            if is_loan and from_personal:
+                reply_lines.append("")
+                reply_lines.append(f"📝 Из личного кармана — касса/кошелёк не тронуты")
+            else:
+                reply_lines.append("")
+                if currency == "usdt":
+                    reply_lines.append(
+                        f"💵 Кошелёк: {fmt_usdt(initial['usdt_balance'])} "
+                        f"{op_sign} {fmt_usdt(p['amount'])} = *{fmt_usdt(final['usdt_balance'])}*")
+                else:
+                    reply_lines.append(
+                        f"💰 Касса: {fmt_rub(initial['ruble_balance'])} "
+                        f"{op_sign} {fmt_rub(p['amount'])} = *{fmt_rub(final['ruble_balance'])}*")
+
             # Для долговых операций — показываем актуальное состояние долгов
-            if t in ("loan_out", "loan_in", "debt_repay_in", "debt_repay_out"):
+            if is_loan:
                 d = get_debts(chat_id)
                 debt_line = format_debt_status(d, focus_name=p["counterparty"])
                 if debt_line:
@@ -2995,6 +3460,21 @@ async def on_confirm_button(cq: CallbackQuery):
     for r in rows:
         apply_balance(chat_id, r)
 
+    # Если в подтверждённых сделках есть реферал — начисляем бонус
+    ref_accruals = []  # (referrer_name, bonus_usdt)
+    for r in rows:
+        if r["type"] in ("sell", "buy"):
+            rn = _tx_get(r, "ref_name")
+            rp = _tx_get(r, "ref_percent")
+            if rn and rp:
+                bonus = round((r["usdt"] or 0) * float(rp) / 100.0, 4)
+                if bonus > 0:
+                    save_tx(chat_id, "referral_accrued", rn, 0, usdt=bonus,
+                            raw=f"ref от #{r['id']:03d}", status="confirmed",
+                            ref_percent=float(rp))
+                    # referral_accrued баланс не меняет — apply_balance ничего не делает
+                    ref_accruals.append((rn, bonus))
+
     final = get_state(chat_id)
     n = len(rows)
     if n == 1:
@@ -3033,6 +3513,14 @@ async def on_confirm_button(cq: CallbackQuery):
             )
     if bad_trades:
         confirm_line += "\n\n" + "\n".join(bad_trades)
+
+    # Реферальные начисления
+    if ref_accruals:
+        confirm_line += "\n"
+        for rn, bonus in ref_accruals:
+            ref_data = get_referrer_balance(chat_id, rn)
+            balance = ref_data["balance"] if ref_data else bonus
+            confirm_line += f"\n🤝 Начислено *{rn}*: +{fmt_usdt(bonus)} (баланс: {fmt_usdt(balance)})"
 
     debt_status = format_debt_status(get_debts(chat_id))
     if debt_status:
