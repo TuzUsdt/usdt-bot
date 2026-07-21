@@ -54,6 +54,12 @@ from aiogram.types import (
 # ────────────────── НАСТРОЙКИ ──────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+# Владелец бота — единственный Telegram user_id, у которого всегда есть доступ.
+# Задаётся переменной окружения OWNER_ID (число, твой Telegram ID).
+# Если 0/не задано — бот работает в «режиме настройки»: любому пишет его собственный ID
+# и не выполняет никаких команд. Так владелец узнаёт свой ID и вписывает его.
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+
 # Где хранить базу. Если задана переменная окружения DATA_DIR (на Railway —
 # точка монтирования Volume, например /data), база живёт там и НЕ стирается
 # при передеплоях. Если переменной нет — база лежит рядом с bot.py (как раньше).
@@ -234,6 +240,28 @@ def init_db():
             conn.execute("PRAGMA user_version = 7")
             log.info("Применил миграцию v7 (валюта долгов, личный карман, рефералы).")
 
+        # v8: whitelist доступа — разрешённые пользователи и чаты
+        if version < 8:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id     INTEGER PRIMARY KEY,
+                    username    TEXT,
+                    note        TEXT,
+                    added_by    INTEGER,
+                    added_at    TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS allowed_chats (
+                    chat_id     INTEGER PRIMARY KEY,
+                    chat_title  TEXT,
+                    added_by    INTEGER,
+                    added_at    TEXT
+                )
+            """)
+            conn.execute("PRAGMA user_version = 8")
+            log.info("Применил миграцию v8 (whitelist доступа).")
+
 
 # ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
@@ -285,6 +313,102 @@ def set_chat_setting(chat_id: int, **kw):
         for k, v in kw.items():
             if k in allowed:
                 conn.execute(f"UPDATE chat_settings SET {k} = ? WHERE chat_id = ?", (v, chat_id))
+
+
+# ───── Whitelist доступа ─────
+def is_user_allowed(user_id: int) -> bool:
+    """Есть ли пользователь в разрешённых (не считая владельца)."""
+    if not user_id:
+        return False
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?",
+                           (user_id,)).fetchone()
+        return row is not None
+
+
+def is_chat_allowed(chat_id: int) -> bool:
+    """Разрешён ли этот чат (обычно группа)."""
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ?",
+                           (chat_id,)).fetchone()
+        return row is not None
+
+
+def add_allowed_user(user_id: int, username: str = None, note: str = None,
+                      added_by: int = None) -> bool:
+    """Добавить пользователя. True если новый, False если уже был."""
+    with db() as conn:
+        existing = conn.execute("SELECT 1 FROM allowed_users WHERE user_id = ?",
+                                (user_id,)).fetchone()
+        if existing:
+            # Обновим username/note если появились
+            conn.execute(
+                "UPDATE allowed_users SET username = COALESCE(?, username), "
+                "note = COALESCE(?, note) WHERE user_id = ?",
+                (username, note, user_id))
+            return False
+        conn.execute(
+            "INSERT INTO allowed_users (user_id, username, note, added_by, added_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, note, added_by, datetime.utcnow().isoformat()))
+        return True
+
+
+def remove_allowed_user(user_id: int) -> bool:
+    with db() as conn:
+        cur = conn.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+        return cur.rowcount > 0
+
+
+def add_allowed_chat(chat_id: int, chat_title: str = None, added_by: int = None) -> bool:
+    """Добавить чат. True если новый, False если уже был."""
+    with db() as conn:
+        existing = conn.execute("SELECT 1 FROM allowed_chats WHERE chat_id = ?",
+                                (chat_id,)).fetchone()
+        if existing:
+            if chat_title:
+                conn.execute("UPDATE allowed_chats SET chat_title = ? WHERE chat_id = ?",
+                             (chat_title, chat_id))
+            return False
+        conn.execute(
+            "INSERT INTO allowed_chats (chat_id, chat_title, added_by, added_at) "
+            "VALUES (?, ?, ?, ?)",
+            (chat_id, chat_title, added_by, datetime.utcnow().isoformat()))
+        return True
+
+
+def remove_allowed_chat(chat_id: int) -> bool:
+    with db() as conn:
+        cur = conn.execute("DELETE FROM allowed_chats WHERE chat_id = ?", (chat_id,))
+        return cur.rowcount > 0
+
+
+def get_allowed_users() -> list:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM allowed_users ORDER BY added_at").fetchall()
+
+
+def get_allowed_chats() -> list:
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM allowed_chats ORDER BY added_at").fetchall()
+
+
+def is_access_allowed(user_id: int, chat_id: int) -> bool:
+    """
+    Главная проверка. Пропускаем если:
+      - user_id это владелец,
+      - user_id в whitelist,
+      - chat_id (обычно группа) в разрешённых чатах.
+    """
+    if OWNER_ID and user_id == OWNER_ID:
+        return True
+    if is_user_allowed(user_id):
+        return True
+    if is_chat_allowed(chat_id):
+        return True
+    return False
 
 
 # ───── Сохранение транзакций ─────
@@ -1796,34 +1920,122 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+# ────────────────── ACCESS CONTROL MIDDLEWARE ──────────────────
+from aiogram import BaseMiddleware
+from aiogram.types import Update, TelegramObject
+from typing import Callable, Awaitable, Any, Dict
+
+
+class AccessMiddleware(BaseMiddleware):
+    """
+    Прослойка проверки доступа. Работает так:
+
+    1. Если OWNER_ID не задан (0) — режим настройки: сообщаем каждому его
+       Telegram ID и не выполняем никаких команд.
+    2. Иначе — проверяем is_access_allowed(user_id, chat_id).
+       Если разрешено — пропускаем к обработчику.
+       Если нет — вежливо отказываем.
+    3. При проходе владельца через групповой чат — автоматически заносим этот
+       чат в разрешённые (чтоб в этой группе все могли писать боту).
+    """
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        # Извлекаем идентификаторы из Message или CallbackQuery
+        user_id = None
+        chat_id = None
+        try:
+            if hasattr(event, "from_user") and event.from_user:
+                user_id = event.from_user.id
+            if hasattr(event, "chat") and event.chat:
+                chat_id = event.chat.id
+            elif hasattr(event, "message") and event.message and event.message.chat:
+                chat_id = event.message.chat.id
+        except Exception:
+            pass
+
+        # Ветка: OWNER_ID не настроен
+        if not OWNER_ID:
+            if hasattr(event, "answer"):
+                try:
+                    await event.answer(
+                        "🔒 Бот в режиме настройки.\n\n"
+                        f"Твой Telegram ID: <code>{user_id}</code>\n\n"
+                        "Если ты владелец — открой Railway → Variables и добавь\n"
+                        f"<code>OWNER_ID = {user_id}</code>\n"
+                        "Затем бот перезапустится и заработает.",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            return  # ничего не пропускаем к обработчику
+
+        # Ветка: проверка whitelist
+        if not is_access_allowed(user_id, chat_id):
+            log.info(f"Отказано в доступе user={user_id} chat={chat_id}")
+            if hasattr(event, "answer"):
+                try:
+                    await event.answer(
+                        "🔒 <b>Доступ к боту закрыт.</b>\n\n"
+                        "Этот бот работает только с ограниченным кругом лиц.\n"
+                        f"Твой ID: <code>{user_id}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            return  # блокируем
+
+        # Ветка: владелец пишет в групповой чат → автоматически разрешаем группу
+        # (chat_id ≠ user_id значит это не личка владельца, а группа)
+        if user_id == OWNER_ID and chat_id and chat_id != user_id:
+            try:
+                title = None
+                if hasattr(event, "chat") and event.chat:
+                    title = event.chat.title
+                added = add_allowed_chat(chat_id, chat_title=title, added_by=user_id)
+                if added:
+                    log.info(f"Автоматически разрешил чат {chat_id} ({title})")
+            except Exception:
+                pass
+
+        return await handler(event, data)
+
+
+dp.message.middleware(AccessMiddleware())
+dp.callback_query.middleware(AccessMiddleware())
+
+
 HELP_MAIN = (
     "👋 Я веду учёт USDT-сделок, кэш-движений, долгов и арбитража.\n"
     "<i>Тип чата:</i> <b>main</b> (твой личный — пишешь все операции)\n\n"
     "📝 <b>USDT-сделки</b> (меняют ₽ и USDT, требуют подтверждения):\n"
-    "<code>Продал Гиге 475600/76.262</code>\n"
-    "<code>Купил у Стефа 1020*74</code>\n"
-    "<code>Влад продал Клиенту 96000/75.7</code>\n"
+    "<code>Продал Клиенту А 475600/76.262</code>\n"
+    "<code>Купил у Партнёра Б 1020*74</code>\n"
+    "<code>Сотрудник продал клиенту 96000/75.7</code>\n"
     "Правило: <code>*</code> слева USDT, <code>/</code> слева рубли.\n\n"
     "💵 <b>Кэш-движения</b> (меняют только ₽):\n"
-    "<code>Выдал Владу 72 600</code>\n"
-    "<code>Принял от Адахана 729 100</code>\n"
+    "<code>Выдал Сотруднику 72 600</code>\n"
+    "<code>Принял от Клиента А 729 100</code>\n"
     "<code>+ 96000 от клиента</code>\n\n"
     "💳 <b>Долги:</b>\n"
-    "<code>Дал в долг Михаилу 90000</code>\n"
-    "<code>Дал в долг Михаилу 500$</code> <i>(долг в USDT)</i>\n"
-    "<code>Дал в долг Михаилу 50000 с личных</code> <i>(не из кассы)</i>\n"
-    "<code>Занял у Васи 200000</code>\n"
-    "<code>Михаил вернул 50000</code>\n"
-    "<code>Вернул Васе 100000</code>\n\n"
+    "<code>Дал в долг Клиенту А 90000</code>\n"
+    "<code>Дал в долг Клиенту А 500$</code> <i>(долг в USDT)</i>\n"
+    "<code>Дал в долг Клиенту А 50000 с личных</code> <i>(не из кассы)</i>\n"
+    "<code>Занял у Партнёра Б 200000</code>\n"
+    "<code>Клиент А вернул 50000</code>\n"
+    "<code>Вернул Партнёру Б 100000</code>\n\n"
     "🤝 <b>Рефералы:</b>\n"
-    "<code>Продал Гиге 90000/76 от Ивана 0.1%</code>\n"
-    "<i>(Иван получит 0.1% от USDT-суммы сделки на реф.баланс)</i>\n\n"
+    "<code>Продал Клиенту А 90000/76 от Реферера 0.1%</code>\n"
+    "<i>(Реферер получит 0.1% от USDT-суммы сделки на реф.баланс)</i>\n\n"
     "🔄 <b>Арбитраж</b> (касса не меняется, профит копится отдельно):\n"
     "<pre>Сделка без моих средств\n"
-    "Купил у Германа 196500/75\n"
-    "Продал Стефу 196500/75.5</pre>\n"
+    "Купил у Партнёра 1 196500/75\n"
+    "Продал Клиенту 2 196500/75.5</pre>\n"
     "👤 <b>Клиенты:</b> пиши имя или @username в сделке —\n"
-    "<code>Продал @vasya_crypto 1000*76</code> — бот сам ведёт по клиенту статистику.\n\n"
+    "<code>Продал @nickname 1000*76</code> — бот сам ведёт по клиенту статистику.\n\n"
     "📊 <b>Команды:</b>\n"
     "/balance · /stats · /rates · /arb · /history · /cashflow\n"
     "/debts · /debt · /client · /clients · /ct\n"
@@ -1831,6 +2043,7 @@ HELP_MAIN = (
     "/day · /week · /month (отчёты за период)\n"
     "/export · /backup (выгрузка Excel и копия базы)\n"
     "/reminders · /setpaydate (автонапоминания)\n"
+    "/allow · /disallow · /allowed (управление доступом)\n"
     "/find · /undo · /pending · /setcash · /settype · /confirm · /help"
 )
 
@@ -1838,15 +2051,15 @@ HELP_FIELD = (
     "👋 Это рабочий чат сотрудника (поле).\n"
     "<i>Тип чата:</i> <b>field</b> — операции сотрудника\n\n"
     "📝 <b>Сделки в поле:</b>\n"
-    "<code>Влад купил у клиента 78200/73.5</code>\n"
-    "<code>Влад продал клиенту 96000/75.7</code>\n\n"
+    "<code>Купил у клиента 78200/73.5</code>\n"
+    "<code>Продал клиенту 96000/75.7</code>\n\n"
     "💵 <b>Кэш на руках:</b>\n"
-    "<code>Выдали Владу 72 600</code> <i>(из общей кассы → на руки Владу)</i>\n"
-    "<code>Принял от клиента 96 000</code> <i>(клиент дал нал)</i>\n"
-    "<code>Влад выдал клиенту 30 000</code>\n\n"
+    "<code>Получил из общей кассы 72 600</code>\n"
+    "<code>Принял от клиента 96 000</code>\n"
+    "<code>Выдал клиенту 30 000</code>\n\n"
     "💳 <b>Долги клиентов:</b>\n"
-    "<code>Дал в долг Серёге 50000</code>\n"
-    "<code>Серёга вернул 50000</code>\n\n"
+    "<code>Дал в долг клиенту 50000</code>\n"
+    "<code>Клиент вернул 50000</code>\n\n"
     "📊 <b>Команды:</b>\n"
     "/balance · /history · /cashflow · /rates · /debts · /client · /clients · "
     "/day · /week · /month · /export · /backup · /find · /undo · /pending · /settype · /help"
@@ -1856,15 +2069,15 @@ HELP_COMMON = (
     "👋 Это чат <b>общей кассы</b>.\n"
     "<i>Тип чата:</i> <b>common</b> — приходы и расходы общего котла\n\n"
     "🔒 <b>Сделки и арбитраж здесь не ведутся</b> — только наличные движения. "
-    "Курсы и спреды видны только в твоём личном чате с ботом.\n\n"
+    "Курсы и спреды видны только в личном чате владельца.\n\n"
     "💵 <b>Что писать сюда:</b>\n"
-    "<code>Принял от Влада 500 000</code> <i>(Влад сдал в кассу)</i>\n"
-    "<code>Принял от Ивана 800 000</code> <i>(Иван внёс в кассу)</i>\n"
-    "<code>Выдал Владу 100 000</code> <i>(касса → Владу на оборотку)</i>\n"
+    "<code>Принял от партнёра 500 000</code>\n"
+    "<code>Принял от клиента 800 000</code>\n"
+    "<code>Выдал сотруднику 100 000</code>\n"
     "<code>Выдал на расходы 30 000</code>\n\n"
     "💳 <b>Долги партнёров:</b>\n"
-    "<code>Дал в долг MTX 1 000 000</code>\n"
-    "<code>MTX вернул 500 000</code>\n\n"
+    "<code>Дал в долг партнёру 1 000 000</code>\n"
+    "<code>Партнёр вернул 500 000</code>\n\n"
     "📊 <b>Команды:</b>\n"
     "/balance · /cashflow · /debts · /day · /week · /month · "
     "/export · /backup · /find · /undo · /history · /settype · /help"
@@ -1891,6 +2104,176 @@ def confirm_kb(batch_id: int) -> InlineKeyboardMarkup:
 @dp.message(Command("help"))
 async def on_start(message: Message):
     await message.answer(help_text(message.chat.id), parse_mode="HTML")
+
+
+@dp.message(Command("allow"))
+async def on_allow(message: Message):
+    """
+    Разрешить пользователю пользоваться ботом.
+    Использование:
+      /allow                  — в ответ на сообщение человека
+      /allow 123456789        — по Telegram user ID
+      /allow 123456789 Влад   — с комментарием
+    """
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("🔒 Только владелец может управлять доступом.")
+        return
+
+    parts = message.text.split(maxsplit=2)
+    target_id = None
+    username = None
+    note = None
+
+    # Reply-режим: /allow в ответ на сообщение
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+        username = message.reply_to_message.from_user.username
+        if len(parts) > 1:
+            note = " ".join(parts[1:])
+    elif len(parts) >= 2:
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await message.answer(
+                "Использование:\n"
+                "• <code>/allow</code> в ответ на сообщение человека\n"
+                "• <code>/allow 123456789</code> — по Telegram ID\n"
+                "• <code>/allow 123456789 комментарий</code>",
+                parse_mode="HTML")
+            return
+        if len(parts) > 2:
+            note = parts[2]
+    else:
+        await message.answer(
+            "Использование:\n"
+            "• <code>/allow</code> в ответ на сообщение человека\n"
+            "• <code>/allow 123456789</code> — по Telegram ID\n"
+            "• <code>/allow 123456789 комментарий</code>",
+            parse_mode="HTML")
+        return
+
+    if target_id == OWNER_ID:
+        await message.answer("Ты владелец — у тебя уже есть доступ.")
+        return
+
+    added = add_allowed_user(target_id, username=username, note=note, added_by=OWNER_ID)
+    if added:
+        who = f"@{username}" if username else f"ID {target_id}"
+        if note:
+            who += f" ({note})"
+        await message.answer(f"✅ Разрешил доступ: <b>{who}</b>", parse_mode="HTML")
+    else:
+        await message.answer(f"Пользователь уже был в whitelist.")
+
+
+@dp.message(Command("disallow"))
+async def on_disallow(message: Message):
+    """Убрать пользователя из whitelist. Синтаксис аналогичный /allow."""
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("🔒 Только владелец может управлять доступом.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    target_id = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    elif len(parts) >= 2:
+        try:
+            target_id = int(parts[1])
+        except ValueError:
+            await message.answer(
+                "Использование:\n"
+                "• <code>/disallow</code> в ответ на сообщение\n"
+                "• <code>/disallow 123456789</code>",
+                parse_mode="HTML")
+            return
+    else:
+        await message.answer(
+            "Использование:\n"
+            "• <code>/disallow</code> в ответ на сообщение\n"
+            "• <code>/disallow 123456789</code>",
+            parse_mode="HTML")
+        return
+
+    if target_id == OWNER_ID:
+        await message.answer("Владельца убрать нельзя.")
+        return
+
+    removed = remove_allowed_user(target_id)
+    if removed:
+        await message.answer(f"✅ Убрал <code>{target_id}</code> из whitelist.",
+                             parse_mode="HTML")
+    else:
+        await message.answer("Такого пользователя в whitelist не было.")
+
+
+@dp.message(Command("allowed"))
+async def on_allowed(message: Message):
+    """Список разрешённых пользователей и чатов. Доступно только владельцу."""
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("🔒 Только владелец может смотреть whitelist.")
+        return
+
+    users = get_allowed_users()
+    chats = get_allowed_chats()
+
+    lines = ["🔐 <b>Whitelist</b>\n"]
+    lines.append(f"👑 Владелец: <code>{OWNER_ID}</code>\n")
+
+    lines.append(f"👥 <b>Разрешённые пользователи ({len(users)}):</b>")
+    if not users:
+        lines.append("   <i>пусто</i>")
+    for u in users:
+        who = f"@{u['username']}" if u['username'] else f"ID {u['user_id']}"
+        note = f" — {u['note']}" if u['note'] else ""
+        lines.append(f"   • <code>{u['user_id']}</code> {who}{note}")
+
+    lines.append(f"\n💬 <b>Разрешённые чаты ({len(chats)}):</b>")
+    if not chats:
+        lines.append("   <i>пусто</i>")
+    for c in chats:
+        title = c['chat_title'] or "без названия"
+        lines.append(f"   • <code>{c['chat_id']}</code> {title}")
+
+    lines.append("\n<i>Добавить: /allow (в ответ на сообщение) или /allow ID</i>")
+    lines.append("<i>Убрать: /disallow ID или /leave_chat ID</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("leave_chat"))
+async def on_leave_chat(message: Message):
+    """
+    Удалить чат из разрешённых.
+    /leave_chat — этот чат
+    /leave_chat -1001234567890 — конкретный chat_id
+    """
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("🔒 Только владелец может управлять доступом.")
+        return
+    parts = message.text.split(maxsplit=1)
+    target = message.chat.id
+    if len(parts) >= 2:
+        try:
+            target = int(parts[1])
+        except ValueError:
+            await message.answer("Ожидаю chat_id (число).")
+            return
+    removed = remove_allowed_chat(target)
+    if removed:
+        await message.answer(f"✅ Убрал чат <code>{target}</code> из разрешённых.",
+                             parse_mode="HTML")
+    else:
+        await message.answer("Такого чата в разрешённых не было.")
+
+
+@dp.message(Command("myid"))
+async def on_myid(message: Message):
+    """Показать Telegram ID отправителя и текущего чата (полезно для настройки)."""
+    await message.answer(
+        f"👤 Твой ID: <code>{message.from_user.id}</code>\n"
+        f"💬 ID этого чата: <code>{message.chat.id}</code>",
+        parse_mode="HTML")
 
 
 @dp.message(Command("settype"))
