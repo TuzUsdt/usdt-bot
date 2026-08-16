@@ -304,6 +304,29 @@ def init_db():
             conn.execute("PRAGMA user_version = 10")
             log.info("Применил миграцию v10 (раздельные стороны сделки).")
 
+        # v11: доллары и евро наличные как отдельные валюты
+        if version < 11:
+            # state: новые кошельки
+            existing_state = {r[1] for r in conn.execute("PRAGMA table_info(state)").fetchall()}
+            if "dollar_balance" not in existing_state:
+                conn.execute("ALTER TABLE state ADD COLUMN dollar_balance REAL DEFAULT 0")
+            if "euro_balance" not in existing_state:
+                conn.execute("ALTER TABLE state ADD COLUMN euro_balance REAL DEFAULT 0")
+
+            # transactions: поля для сумм в других валютах и комиссия
+            existing_tx = {r[1] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+            for col, decl in {
+                "dollars":        "REAL DEFAULT 0",      # сумма долларов в операции
+                "euros":          "REAL DEFAULT 0",       # сумма евро в операции
+                "fee_percent":    "REAL",                 # процент для сделок с комиссией
+                "currency_pair":  "TEXT",                 # 'rub-usdt', 'usd-rub', 'usd-usdt', 'eur-usdt', 'usd-eur', ...
+            }.items():
+                if col not in existing_tx:
+                    conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {decl}")
+
+            conn.execute("PRAGMA user_version = 11")
+            log.info("Применил миграцию v11 (доллары и евро).")
+
 
 # ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
@@ -312,26 +335,32 @@ def get_state(chat_id: int) -> dict:
         if not row:
             conn.execute("INSERT INTO state (chat_id) VALUES (?)", (chat_id,))
             return {"ruble_balance": 0.0, "usdt_balance": 0.0,
-                    "extra_rubles": 0.0, "arb_profit_usdt": 0.0}
+                    "extra_rubles": 0.0, "arb_profit_usdt": 0.0,
+                    "dollar_balance": 0.0, "euro_balance": 0.0}
         d = dict(row)
         d.setdefault("arb_profit_usdt", 0.0)
+        d.setdefault("dollar_balance", 0.0)
+        d.setdefault("euro_balance", 0.0)
         return d
 
 
 def update_state(chat_id: int, d_rubles: float = 0, d_usdt: float = 0,
-                 d_arb_profit: float = 0):
+                 d_arb_profit: float = 0, d_dollars: float = 0, d_euros: float = 0):
     """
     Обновить состояние. d_arb_profit меняет ТОЛЬКО отдельный счётчик
     дохода с арбитража, не трогая кошелёк USDT и кассу.
+    d_dollars и d_euros — наличные доллары и евро.
     """
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO state (chat_id) VALUES (?)", (chat_id,))
         conn.execute(
             "UPDATE state SET ruble_balance = ruble_balance + ?, "
             "usdt_balance = usdt_balance + ?, "
-            "arb_profit_usdt = COALESCE(arb_profit_usdt, 0) + ? "
+            "arb_profit_usdt = COALESCE(arb_profit_usdt, 0) + ?, "
+            "dollar_balance = COALESCE(dollar_balance, 0) + ?, "
+            "euro_balance = COALESCE(euro_balance, 0) + ? "
             "WHERE chat_id = ?",
-            (d_rubles, d_usdt, d_arb_profit, chat_id)
+            (d_rubles, d_usdt, d_arb_profit, d_dollars, d_euros, chat_id)
         )
 
 
@@ -828,25 +857,14 @@ def name_root(name: str) -> str:
 
 def get_debts(chat_id: int) -> dict:
     """
-    Считает открытые долги по этому чату, раздельно по валютам.
+    Считает открытые долги по этому чату, раздельно по 4 валютам.
 
-    Возвращает {
-        # ── Рубли (обратная совместимость — старые ключи) ──
-        "owed_to_us":           [(name, amount), ...],  # нам должны ₽
-        "we_owe":               [(name, amount), ...],  # мы должны ₽
-        "total_owed_to_us":     float,
-        "total_we_owe":         float,
-
-        # ── USDT ──
-        "owed_to_us_usdt":      [(name, amount), ...],
-        "we_owe_usdt":          [(name, amount), ...],
-        "total_owed_to_us_usdt": float,
-        "total_we_owe_usdt":    float,
-    }
-
-    Имена группируются через name_root.
-    Личный карман (from_personal=1) тоже учитывается — долг всё равно
-    числится за человеком, просто касса/кошелёк не двигались.
+    Возвращает ключи для каждой валюты (rub, usdt, usd, eur):
+      owed_to_us[_usdt|_usd|_eur]        — [(name, amount), ...] нам должны
+      we_owe[_usdt|_usd|_eur]            — [(name, amount), ...] мы должны
+      total_owed_to_us[_usdt|_usd|_eur]  — суммы
+      total_we_owe[_usdt|_usd|_eur]      — суммы
+    Ключи без суффикса — рубли (обратная совместимость).
     """
     with db() as conn:
         all_loan_rows = conn.execute(
@@ -857,14 +875,15 @@ def get_debts(chat_id: int) -> dict:
             (chat_id,)).fetchall()
 
     # acc[(currency, side)][root] = {bal, display_name}
-    # side: 'owed_to_us' | 'we_owe'
-    acc = {("rub","owed_to_us"): {}, ("rub","we_owe"): {},
-           ("usdt","owed_to_us"): {}, ("usdt","we_owe"): {}}
+    CURRENCIES = ("rub", "usdt", "usd", "eur")
+    acc = {(c, s): {} for c in CURRENCIES for s in ("owed_to_us", "we_owe")}
 
     for r in all_loan_rows:
         cp = r["counterparty"] or "—"
         root = name_root(cp)
         cur = _tx_get(r, "currency", "rub") or "rub"
+        if cur not in CURRENCIES:
+            cur = "rub"
         t = r["type"]
 
         if t == "loan_out":
@@ -880,7 +899,7 @@ def get_debts(chat_id: int) -> dict:
 
         d = acc[key].setdefault(root, {"bal": 0.0, "display_name": cp})
         d["bal"] += delta
-        if delta > 0:  # обновляем имя только при «увеличении» долга, не при возврате
+        if delta > 0:
             d["display_name"] = cp
 
     def collect(key):
@@ -889,21 +908,23 @@ def get_debts(chat_id: int) -> dict:
              for v in acc[key].values() if v["bal"] > 0.01],
             key=lambda x: -x[1])
 
-    owed_rub  = collect(("rub","owed_to_us"))
-    we_rub    = collect(("rub","we_owe"))
-    owed_usdt = collect(("usdt","owed_to_us"))
-    we_usdt   = collect(("usdt","we_owe"))
-
-    return {
-        "owed_to_us":            owed_rub,
-        "we_owe":                we_rub,
-        "total_owed_to_us":      sum(a for _, a in owed_rub),
-        "total_we_owe":          sum(a for _, a in we_rub),
-        "owed_to_us_usdt":       owed_usdt,
-        "we_owe_usdt":           we_usdt,
-        "total_owed_to_us_usdt": sum(a for _, a in owed_usdt),
-        "total_we_owe_usdt":     sum(a for _, a in we_usdt),
+    result = {
+        # Рубли (без суффикса — обратная совместимость)
+        "owed_to_us":       collect(("rub", "owed_to_us")),
+        "we_owe":           collect(("rub", "we_owe")),
+        # USDT
+        "owed_to_us_usdt":  collect(("usdt", "owed_to_us")),
+        "we_owe_usdt":      collect(("usdt", "we_owe")),
+        # USD
+        "owed_to_us_usd":   collect(("usd", "owed_to_us")),
+        "we_owe_usd":       collect(("usd", "we_owe")),
+        # EUR
+        "owed_to_us_eur":   collect(("eur", "owed_to_us")),
+        "we_owe_eur":       collect(("eur", "we_owe")),
     }
+    for k in list(result.keys()):
+        result["total_" + k] = sum(a for _, a in result[k])
+    return result
 
 
 def get_debt_history(chat_id: int, name: str) -> list:
@@ -917,6 +938,56 @@ def get_debt_history(chat_id: int, name: str) -> list:
             (chat_id,)).fetchall()
     # Фильтруем по корню
     return [r for r in rows if name_root(r["counterparty"] or "") == target_root]
+
+
+def guess_return_from_personal(chat_id: int, name: str, currency: str,
+                                return_type: str) -> bool:
+    """
+    Возвращает True, если возврат по этому имени и валюте разумно считать
+    «в личный карман» (не через кассу).
+
+    Логика: если все ОТКРЫТЫЕ выдачи в этой валюте были помечены from_personal=1
+    и ещё есть непогашенный «личный» долг — возврат идёт в личное.
+    Если долг смешанный (и с личных, и с кассы) — возврат идёт в кассу
+    (пользователь может явно перекрыть словом «в личные»).
+    """
+    history = get_debt_history(chat_id, name)
+    # Смотрим только на нужную валюту
+    history = [r for r in history if (_tx_get(r, "currency", "rub") or "rub") == currency]
+    if not history:
+        return False
+
+    # debt_repay_in закрывает loan_out (нам возвращают)
+    # debt_repay_out закрывает loan_in (мы возвращаем)
+    if return_type == "debt_repay_in":
+        outstanding_types = ("loan_out",)
+    elif return_type == "debt_repay_out":
+        outstanding_types = ("loan_in",)
+    else:
+        return False
+
+    # Считаем баланс отдельно для «личных» и «кассовых» выдач
+    personal_outstanding = 0.0
+    cassa_outstanding = 0.0
+    for r in history:
+        if r["type"] in outstanding_types:
+            amt = r["rubles"]
+            if bool(_tx_get(r, "from_personal", 0)):
+                personal_outstanding += amt
+            else:
+                cassa_outstanding += amt
+        elif r["type"] == ("debt_repay_in" if return_type == "debt_repay_in" else "debt_repay_out"):
+            # Уменьшаем сначала соответствующую сторону
+            amt = r["rubles"]
+            if bool(_tx_get(r, "from_personal", 0)):
+                personal_outstanding -= amt
+            else:
+                cassa_outstanding -= amt
+
+    # Если открыт только «личный» долг → возврат тоже личный
+    if personal_outstanding > 0.01 and cassa_outstanding < 0.01:
+        return True
+    return False
 
 
 # ───── Клиенты ─────
@@ -1694,7 +1765,7 @@ def parse_trade(text: str):
 
 
 def parse_cash_flow(text: str):
-    """Кэш-движение (только рубли). Возвращает dict или None."""
+    """Кэш-движение (₽, USDT, $, €). Возвращает dict или None."""
     text = text.strip()
 
     explicit_dir = None
@@ -1703,7 +1774,29 @@ def parse_cash_flow(text: str):
         explicit_dir = "cash_out" if m_sign.group(1) in "-—–" else "cash_in"
         text = text[m_sign.end():].strip()
 
-    lower = text.lower()
+    # Вырежем маркер валюты из конца (если есть). Логика та же что в parse_loan.
+    def detect_currency(s):
+        m_usdt = re.search(r"(\d[\d\s\u00a0.,]*\d|\d)\s*(usdt|тизер|тезер|тизера|тезера)\s*$",
+                           s, re.IGNORECASE)
+        if m_usdt:
+            return s[:m_usdt.end(1)] + s[m_usdt.end():], "usdt"
+        m_eur = re.search(r"(\d[\d\s\u00a0.,]*\d|\d)\s*(€|eur|евро)\s*$", s, re.IGNORECASE)
+        if m_eur:
+            return s[:m_eur.end(1)] + s[m_eur.end():], "eur"
+        m_eur_pre = re.search(r"€\s*(\d[\d\s\u00a0.,]*\d|\d)\s*$", s)
+        if m_eur_pre:
+            return s[:m_eur_pre.start()] + m_eur_pre.group(1), "eur"
+        m_usd = re.search(r"(\d[\d\s\u00a0.,]*\d|\d)\s*(\$|usd|долл(?:ар(?:ов|а)?)?)\s*$",
+                          s, re.IGNORECASE)
+        if m_usd:
+            return s[:m_usd.end(1)] + s[m_usd.end():], "usd"
+        m_usd_pre = re.search(r"\$\s*(\d[\d\s\u00a0.,]*\d|\d)\s*$", s)
+        if m_usd_pre:
+            return s[:m_usd_pre.start()] + m_usd_pre.group(1), "usd"
+        return s, "rub"
+
+    text_clean, currency = detect_currency(text)
+    lower = text_clean.lower()
 
     kind, vs, ve = _find_verb(lower, [
         ("cash_in", CASH_IN_VERBS),
@@ -1713,7 +1806,7 @@ def parse_cash_flow(text: str):
     if not kind:
         if not explicit_dir:
             return None
-        m_amt = re.search(NUM_PATTERN, text)
+        m_amt = re.search(NUM_PATTERN, text_clean)
         if not m_amt:
             return None
         try:
@@ -1722,18 +1815,19 @@ def parse_cash_flow(text: str):
             return None
         if amount <= 0:
             return None
-        before = text[:m_amt.start()].strip(" ,:.")
-        after = text[m_amt.end():].strip(" ,:.")
+        before = text_clean[:m_amt.start()].strip(" ,:.")
+        after = text_clean[m_amt.end():].strip(" ,:.")
         for prep in ("от ", "у ", "из ", "к ", "для "):
             if after.lower().startswith(prep):
                 after = after[len(prep):].strip()
                 break
         counterparty = (before + " " + after).strip().strip(",:.") or "—"
-        return {"type": explicit_dir, "doer": None, "counterparty": counterparty, "amount": amount}
+        return {"type": explicit_dir, "doer": None, "counterparty": counterparty,
+                "amount": amount, "currency": currency}
 
     direction = kind
-    doer = text[:vs].strip() or None
-    rest = text[ve:].lstrip()
+    doer = text_clean[:vs].strip() or None
+    rest = text_clean[ve:].lstrip()
     for prep in ("у ", "у\u00a0", "от ", "от\u00a0", "из ", "к ", "для "):
         if rest.lower().startswith(prep):
             rest = rest[len(prep):].lstrip()
@@ -1751,7 +1845,8 @@ def parse_cash_flow(text: str):
         return None
 
     target = rest[:last_m.start()].strip().rstrip(",:.").rstrip().rstrip("—-").strip() or "—"
-    return {"type": direction, "doer": doer, "counterparty": target, "amount": amount}
+    return {"type": direction, "doer": doer, "counterparty": target,
+            "amount": amount, "currency": currency}
 
 
 def parse_loan(text: str):
@@ -1777,10 +1872,16 @@ def parse_loan(text: str):
     """
     t = text.strip().lstrip("+-—– ").strip()
 
-    # 1. Отделяем «с личных»
+    # 1. Отделяем маркер «личного кармана» (не через кассу)
+    #    Работает для обеих сторон:
+    #    - выдача: «Дал в долг ... с личных / из личных / из кармана / не из кассы»
+    #    - возврат: «... вернул ... в личные / на личные / лично / в карман»
     from_personal = False
     m = re.search(
-        r"\s+(с\s+личных|из\s+личных|личные|из\s+кармана|не\s+из\s+кассы)\s*$",
+        r"\s+(с\s+личных|из\s+личных|личные|"
+        r"из\s+кармана|в\s+карман|на\s+карман|"
+        r"в\s+личные|на\s+личные|лично|"
+        r"не\s+из\s+кассы|мимо\s+кассы)\s*$",
         t, re.IGNORECASE)
     if m:
         from_personal = True
@@ -1788,22 +1889,51 @@ def parse_loan(text: str):
 
     # 2. Универсальная функция: определить валюту и очистить строку
     def split_currency(s):
-        """Возвращает (clean_text, currency). currency='usdt' если есть $/USDT, иначе 'rub'."""
-        # $ или USDT прямо после числа в конце (с пробелом или без): «500$», «500 $», «500 USDT», «500usdt»
+        """
+        Возвращает (clean_text, currency). Валюты:
+          - 'usdt' — крипта (USDT, usdt, тизер, тезер)
+          - 'usd'  — наличные доллары ($, USD, доллары, долл)
+          - 'eur'  — наличные евро (€, EUR, евро)
+          - 'rub'  — рубли (по умолчанию)
+        Приоритет: USDT > $/USD > €/EUR > rub
+        """
+        # USDT — специфичнее, ищем первым чтобы «100 USDT» не сожрало $-парсер
         m_usdt = re.search(
-            r"(\d[\d\s\u00a0.,]*\d|\d)\s*(\$|usdt|usd|долл(?:ар(?:ов|а)?)?)\s*₽?\s*$",
+            r"(\d[\d\s\u00a0.,]*\d|\d)\s*(usdt|тизер|тезер|тизера|тезера)\s*₽?\s*$",
             s, re.IGNORECASE)
         if m_usdt:
-            # Оставляем число, режем валютный суффикс
             cleaned = s[:m_usdt.end(1)] + s[m_usdt.end():]
             cleaned = re.sub(r"\s+", " ", cleaned).strip()
             return cleaned, "usdt"
-        # $ перед числом: «$500»
-        m_pre = re.search(r"\$\s*(\d[\d\s\u00a0.,]*\d|\d)\s*$", s)
-        if m_pre:
-            cleaned = s[:m_pre.start()] + m_pre.group(1)
+
+        # Евро: €500, 500€, 500 EUR, 500 евро
+        m_eur = re.search(
+            r"(\d[\d\s\u00a0.,]*\d|\d)\s*(€|eur|евро)\s*$",
+            s, re.IGNORECASE)
+        if m_eur:
+            cleaned = s[:m_eur.end(1)] + s[m_eur.end():]
             cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            return cleaned, "usdt"
+            return cleaned, "eur"
+        m_eur_pre = re.search(r"€\s*(\d[\d\s\u00a0.,]*\d|\d)\s*$", s)
+        if m_eur_pre:
+            cleaned = s[:m_eur_pre.start()] + m_eur_pre.group(1)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned, "eur"
+
+        # Доллары наличные: $500, 500$, 500 USD, 500 долларов
+        m_usd = re.search(
+            r"(\d[\d\s\u00a0.,]*\d|\d)\s*(\$|usd|долл(?:ар(?:ов|а)?)?)\s*₽?\s*$",
+            s, re.IGNORECASE)
+        if m_usd:
+            cleaned = s[:m_usd.end(1)] + s[m_usd.end():]
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned, "usd"
+        m_usd_pre = re.search(r"\$\s*(\d[\d\s\u00a0.,]*\d|\d)\s*$", s)
+        if m_usd_pre:
+            cleaned = s[:m_usd_pre.start()] + m_usd_pre.group(1)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned, "usd"
+
         return s, "rub"
 
     t_clean, currency = split_currency(t)
@@ -2011,6 +2141,36 @@ def fmt_usdt(n: float) -> str:
     return f"{sign}{s} USDT"
 
 
+def fmt_usd(n: float) -> str:
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    s = f"{n:,.2f}".replace(",", " ")
+    if s.endswith(".00"):
+        s = s[:-3]
+    return f"{sign}{s}$"
+
+
+def fmt_eur(n: float) -> str:
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    s = f"{n:,.2f}".replace(",", " ")
+    if s.endswith(".00"):
+        s = s[:-3]
+    return f"{sign}{s}€"
+
+
+def fmt_currency(amount: float, currency: str) -> str:
+    """Универсальный форматтер по коду валюты: 'rub' | 'usdt' | 'usd' | 'eur'."""
+    c = (currency or "rub").lower()
+    if c == "usdt":
+        return fmt_usdt(amount)
+    if c == "usd":
+        return fmt_usd(amount)
+    if c == "eur":
+        return fmt_eur(amount)
+    return fmt_rub(amount)
+
+
 def fmt_rate(n: float) -> str:
     s = f"{n:.4f}".rstrip("0").rstrip(".")
     return s or "0"
@@ -2126,9 +2286,23 @@ def apply_balance(chat_id: int, tx_row) -> None:
         return
 
     if t == "cash_in":
-        update_state(chat_id, d_rubles=tx_row["rubles"])
+        if currency == "usd":
+            update_state(chat_id, d_dollars=tx_row["rubles"])
+        elif currency == "eur":
+            update_state(chat_id, d_euros=tx_row["rubles"])
+        elif currency == "usdt":
+            update_state(chat_id, d_usdt=tx_row["rubles"])
+        else:
+            update_state(chat_id, d_rubles=tx_row["rubles"])
     elif t == "cash_out":
-        update_state(chat_id, d_rubles=-tx_row["rubles"])
+        if currency == "usd":
+            update_state(chat_id, d_dollars=-tx_row["rubles"])
+        elif currency == "eur":
+            update_state(chat_id, d_euros=-tx_row["rubles"])
+        elif currency == "usdt":
+            update_state(chat_id, d_usdt=-tx_row["rubles"])
+        else:
+            update_state(chat_id, d_rubles=-tx_row["rubles"])
     elif t == "arb":
         # Арбитраж НЕ трогает кассу и кошелёк USDT.
         # Профит копится в отдельном счётчике "доход с арбитража".
@@ -2143,6 +2317,10 @@ def apply_balance(chat_id: int, tx_row) -> None:
         amount = tx_row["rubles"]
         if currency == "usdt":
             update_state(chat_id, d_usdt=sign * amount)
+        elif currency == "usd":
+            update_state(chat_id, d_dollars=sign * amount)
+        elif currency == "eur":
+            update_state(chat_id, d_euros=sign * amount)
         else:
             update_state(chat_id, d_rubles=sign * amount)
     elif t == "referral_accrued":
@@ -2175,9 +2353,23 @@ def reverse_balance(chat_id: int, tx_row) -> None:
         return
 
     if t == "cash_in":
-        update_state(chat_id, d_rubles=-tx_row["rubles"])
+        if currency == "usd":
+            update_state(chat_id, d_dollars=-tx_row["rubles"])
+        elif currency == "eur":
+            update_state(chat_id, d_euros=-tx_row["rubles"])
+        elif currency == "usdt":
+            update_state(chat_id, d_usdt=-tx_row["rubles"])
+        else:
+            update_state(chat_id, d_rubles=-tx_row["rubles"])
     elif t == "cash_out":
-        update_state(chat_id, d_rubles=tx_row["rubles"])
+        if currency == "usd":
+            update_state(chat_id, d_dollars=tx_row["rubles"])
+        elif currency == "eur":
+            update_state(chat_id, d_euros=tx_row["rubles"])
+        elif currency == "usdt":
+            update_state(chat_id, d_usdt=tx_row["rubles"])
+        else:
+            update_state(chat_id, d_rubles=tx_row["rubles"])
     elif t == "arb":
         update_state(chat_id, d_arb_profit=-tx_row["usdt"])
     elif t in ("loan_out", "loan_in", "debt_repay_in", "debt_repay_out"):
@@ -2187,6 +2379,10 @@ def reverse_balance(chat_id: int, tx_row) -> None:
         amount = tx_row["rubles"]
         if currency == "usdt":
             update_state(chat_id, d_usdt=-sign * amount)
+        elif currency == "usd":
+            update_state(chat_id, d_dollars=-sign * amount)
+        elif currency == "eur":
+            update_state(chat_id, d_euros=-sign * amount)
         else:
             update_state(chat_id, d_rubles=-sign * amount)
     elif t == "referral_accrued":
@@ -2649,6 +2845,11 @@ async def on_balance(message: Message):
 
     s = get_state(chat_id)
     text = f"💰 *Касса в руках:* {fmt_rub(s['ruble_balance'])}\n💵 *Кошелёк:* {fmt_usdt(s['usdt_balance'])}"
+    # Наличные $ и € — показываем только если ненулевые
+    if s.get("dollar_balance", 0):
+        text += f"\n💴 *Доллары нал:* {fmt_usd(s['dollar_balance'])}"
+    if s.get("euro_balance", 0):
+        text += f"\n💶 *Евро нал:* {fmt_eur(s['euro_balance'])}"
     arb_total = s.get("arb_profit_usdt", 0) or 0
     if arb_total:
         text += f"\n💼 *Доход с арбитража:* {fmt_usdt(arb_total)}"
@@ -3004,50 +3205,47 @@ async def on_debts(message: Message):
     d = get_debts(message.chat.id)
     lines = ["💳 *Долги*"]
 
-    has_rub = bool(d["owed_to_us"] or d["we_owe"])
-    has_usdt = bool(d["owed_to_us_usdt"] or d["we_owe_usdt"])
-
-    if not has_rub and not has_usdt:
+    has_any = any((d[k] or d[k.replace("owed_to_us", "we_owe")])
+                  for k in ["owed_to_us", "owed_to_us_usdt", "owed_to_us_usd", "owed_to_us_eur"])
+    if not has_any:
         lines.append("\nДолгов нет.")
         await message.answer("\n".join(lines), parse_mode="Markdown")
         return
 
-    # ── Рубли ──
-    if has_rub:
-        lines.append("\n🇷🇺 *В рублях:*")
-        if d["owed_to_us"]:
-            lines.append(f"   📥 Нам должны: *{fmt_rub(d['total_owed_to_us'])}*")
-            for name, amt in d["owed_to_us"]:
-                lines.append(f"      • {name}: {fmt_rub(amt)}")
-        if d["we_owe"]:
-            lines.append(f"   📤 Мы должны: *{fmt_rub(d['total_we_owe'])}*")
-            for name, amt in d["we_owe"]:
-                lines.append(f"      • {name}: {fmt_rub(amt)}")
-        net_rub = d["total_owed_to_us"] - d["total_we_owe"]
-        if net_rub > 0:
-            lines.append(f"   📊 Чистый: +{fmt_rub(net_rub)}")
-        elif net_rub < 0:
-            lines.append(f"   📊 Чистый: −{fmt_rub(abs(net_rub))}")
+    def block(title, key_owed, key_we, total_owed, total_we, fmt_func):
+        """Формирует один блок для одной валюты."""
+        if not (d[key_owed] or d[key_we]):
+            return []
+        out = [f"\n{title}"]
+        if d[key_owed]:
+            out.append(f"   📥 Нам должны: *{fmt_func(d[total_owed])}*")
+            for name, amt in d[key_owed]:
+                out.append(f"      • {name}: {fmt_func(amt)}")
+        if d[key_we]:
+            out.append(f"   📤 Мы должны: *{fmt_func(d[total_we])}*")
+            for name, amt in d[key_we]:
+                out.append(f"      • {name}: {fmt_func(amt)}")
+        net = d[total_owed] - d[total_we]
+        if abs(net) > 0.01:
+            sign = "+" if net > 0 else "−"
+            out.append(f"   📊 Чистый: {sign}{fmt_func(abs(net))}")
+        return out
 
-    # ── USDT ──
-    if has_usdt:
-        lines.append("\n💵 *В USDT:*")
-        if d["owed_to_us_usdt"]:
-            lines.append(f"   📥 Нам должны: *{fmt_usdt(d['total_owed_to_us_usdt'])}*")
-            for name, amt in d["owed_to_us_usdt"]:
-                lines.append(f"      • {name}: {fmt_usdt(amt)}")
-        if d["we_owe_usdt"]:
-            lines.append(f"   📤 Мы должны: *{fmt_usdt(d['total_we_owe_usdt'])}*")
-            for name, amt in d["we_owe_usdt"]:
-                lines.append(f"      • {name}: {fmt_usdt(amt)}")
-        net_usdt = d["total_owed_to_us_usdt"] - d["total_we_owe_usdt"]
-        if net_usdt > 0:
-            lines.append(f"   📊 Чистый: +{fmt_usdt(net_usdt)}")
-        elif net_usdt < 0:
-            lines.append(f"   📊 Чистый: −{fmt_usdt(abs(net_usdt))}")
+    lines += block("🇷🇺 *В рублях:*",
+                   "owed_to_us", "we_owe",
+                   "total_owed_to_us", "total_we_owe", fmt_rub)
+    lines += block("💵 *В USDT:*",
+                   "owed_to_us_usdt", "we_owe_usdt",
+                   "total_owed_to_us_usdt", "total_we_owe_usdt", fmt_usdt)
+    lines += block("💴 *В $ (наличные):*",
+                   "owed_to_us_usd", "we_owe_usd",
+                   "total_owed_to_us_usd", "total_we_owe_usd", fmt_usd)
+    lines += block("💶 *В € (наличные):*",
+                   "owed_to_us_eur", "we_owe_eur",
+                   "total_owed_to_us_eur", "total_we_owe_eur", fmt_eur)
 
     lines.append("\n_Деталь по человеку:_ `/debt <имя>`")
-    lines.append("_В долг в USDT:_ `Дал в долг Михаилу 500$`")
+    lines.append("_В долг в разных валютах:_ `500$`, `500€`, `500 USDT`, `500`")
     lines.append("_Из личного кармана:_ дописать ` с личных` в конце")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
@@ -3824,25 +4022,86 @@ async def on_reset(message: Message):
 
 @dp.message(Command("setcash"))
 async def on_setcash(message: Message):
-    parts = message.text.split()
-    if len(parts) < 2:
+    """
+    Задать балансы вручную. Поддерживает 4 валюты через суффиксы:
+      /setcash 4348000            → только рубли
+      /setcash 4348000 1500       → рубли + USDT (обратная совместимость)
+      /setcash 4348000₽ 3000$ 500€ 1500 usdt   → все валюты в любом порядке
+    Каждый аргумент — число + суффикс валюты (₽/$/€/usdt).
+    Пропущенные валюты остаются как были.
+    """
+    parts = message.text.split()[1:]
+    if not parts:
         await message.answer(
-            "Использование: `/setcash <рубли> [USDT]`\nНапример: `/setcash 4348000 1500`",
+            "Использование:\n"
+            "• `/setcash 4348000` — только рубли\n"
+            "• `/setcash 4348000 1500` — рубли и USDT\n"
+            "• `/setcash 4348000₽ 3000$ 500€ 1500 usdt` — все валюты\n\n"
+            "Валюты определяются по суффиксу: ₽/руб, $/usd/долл, €/eur/евро, usdt/тизер",
             parse_mode="Markdown")
         return
-    try:
-        rub = parse_number(parts[1])
-        usdt = parse_number(parts[2]) if len(parts) > 2 else 0
-    except ValueError:
-        await message.answer("Не понял числа. Пример: `/setcash 4348000 1500`", parse_mode="Markdown")
-        return
+
+    # Собираем значения: если суффикс не указан у первого — считаем рублями,
+    # если у второго — USDT (обратная совместимость)
+    values = {}  # currency -> amount
+    for i, arg in enumerate(parts):
+        arg = arg.strip().replace(",", ".")
+        # Определить валюту по суффиксу
+        low = arg.lower()
+        if low.endswith("usdt") or low.endswith("тизер") or low.endswith("тезер"):
+            cur = "usdt"
+            num_str = re.sub(r"(usdt|тизер|тезер)$", "", arg, flags=re.IGNORECASE).strip()
+        elif arg.endswith("$") or low.endswith("usd") or low.endswith("долл"):
+            cur = "usd"
+            num_str = re.sub(r"(\$|usd|долл(?:ар(?:ов|а)?)?)$", "", arg, flags=re.IGNORECASE).strip()
+        elif arg.startswith("$"):
+            cur = "usd"; num_str = arg[1:]
+        elif arg.endswith("€") or low.endswith("eur") or low.endswith("евро"):
+            cur = "eur"
+            num_str = re.sub(r"(€|eur|евро)$", "", arg, flags=re.IGNORECASE).strip()
+        elif arg.startswith("€"):
+            cur = "eur"; num_str = arg[1:]
+        elif arg.endswith("₽") or low.endswith("руб") or low.endswith("р"):
+            cur = "rub"
+            num_str = re.sub(r"(₽|руб(?:лей|ля|ль)?|р)$", "", arg, flags=re.IGNORECASE).strip()
+        else:
+            # Без суффикса. Обратная совместимость: первый = ₽, второй = USDT.
+            if i == 0:
+                cur = "rub"
+            elif i == 1:
+                cur = "usdt"
+            else:
+                await message.answer(
+                    f"Не понял аргумент `{arg}` — укажи валюту суффиксом (₽/$/€/usdt).",
+                    parse_mode="Markdown")
+                return
+            num_str = arg
+        try:
+            values[cur] = parse_number(num_str)
+        except ValueError:
+            await message.answer(f"Не смог прочитать число в `{arg}`.", parse_mode="Markdown")
+            return
+
+    # Применяем: только явно указанные валюты меняем
     with db() as conn:
-        conn.execute(
-            "INSERT INTO state (chat_id, ruble_balance, usdt_balance) VALUES (?, ?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET ruble_balance = excluded.ruble_balance, "
-            "usdt_balance = excluded.usdt_balance",
-            (message.chat.id, rub, usdt))
-    await message.answer(f"✅ Касса: {fmt_rub(rub)}\n💵 Кошелёк: {fmt_usdt(usdt)}")
+        conn.execute("INSERT OR IGNORE INTO state (chat_id) VALUES (?)", (message.chat.id,))
+        col_map = {"rub": "ruble_balance", "usdt": "usdt_balance",
+                   "usd": "dollar_balance", "eur": "euro_balance"}
+        for cur, amt in values.items():
+            col = col_map[cur]
+            conn.execute(f"UPDATE state SET {col} = ? WHERE chat_id = ?",
+                         (amt, message.chat.id))
+
+    # Показываем финальный баланс всех валют
+    s = get_state(message.chat.id)
+    lines = ["✅ Балансы обновлены:"]
+    lines.append(f"💰 Касса: {fmt_rub(s['ruble_balance'])}")
+    lines.append(f"💵 Кошелёк: {fmt_usdt(s['usdt_balance'])}")
+    if s.get("dollar_balance", 0):
+        lines.append(f"💴 Доллары нал: {fmt_usd(s['dollar_balance'])}")
+    if s.get("euro_balance", 0):
+        lines.append(f"💶 Евро нал: {fmt_eur(s['euro_balance'])}")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("extra"))
@@ -4124,14 +4383,25 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
                     p["_ref_tid"] = ref_tid
         else:
             # cash / долги: передаём валюту и личный карман, если есть
+            from_personal = p.get("from_personal", 0)
+
+            # ── Умная авто-детекция «личного» возврата ──
+            # Если пользователь не указал явно, но у этого имени + валюты
+            # открыт долг только «с личных» — возврат тоже идёт в личное.
+            if not from_personal and t in ("debt_repay_in", "debt_repay_out"):
+                if guess_return_from_personal(chat_id, cp,
+                                               p.get("currency", "rub"), t):
+                    from_personal = 1
+                    p["from_personal"] = 1  # для последующего форматирования ответа
+
             tid = save_tx(chat_id, t, cp, p["amount"],
                           raw=raw, doer=p.get("doer"), status="confirmed",
                           currency=p.get("currency", "rub"),
-                          from_personal=p.get("from_personal", 0))
+                          from_personal=from_personal)
             apply_balance(chat_id, {
                 "type": t, "usdt": 0, "rubles": p["amount"],
                 "currency": p.get("currency", "rub"),
-                "from_personal": p.get("from_personal", 0),
+                "from_personal": from_personal,
             })
         saved.append((tid, p))
 
