@@ -262,6 +262,30 @@ def init_db():
             conn.execute("PRAGMA user_version = 8")
             log.info("Применил миграцию v8 (whitelist доступа).")
 
+        # v9: механика «сделка в кредит» + связь с чатом задач Влада
+        if version < 9:
+            # transactions: paid, paid_at, task_message_id, task_chat_id
+            existing_tx = {r[1] for r in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+            for col, decl in {
+                "paid":            "INTEGER DEFAULT 1",  # 1 = оплачено сразу, 0 = в кредит
+                "paid_at":         "TEXT",               # когда пометили как оплачено
+                "task_chat_id":    "INTEGER",            # чат-задачи куда отправлена задача
+                "task_message_id": "INTEGER",            # id сообщения-задачи
+            }.items():
+                if col not in existing_tx:
+                    conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {decl}")
+
+            # chat_settings: linked_main_chat_id (для tasks-чата)
+            existing_cs = {r[1] for r in conn.execute("PRAGMA table_info(chat_settings)").fetchall()}
+            if "linked_main_chat_id" not in existing_cs:
+                conn.execute("ALTER TABLE chat_settings ADD COLUMN linked_main_chat_id INTEGER")
+            if "tasks_chat_id" not in existing_cs:
+                # обратная связь: у main-чата ссылка на его tasks-чат
+                conn.execute("ALTER TABLE chat_settings ADD COLUMN tasks_chat_id INTEGER")
+
+            conn.execute("PRAGMA user_version = 9")
+            log.info("Применил миграцию v9 (кредит + задачи Владу).")
+
 
 # ───── Состояние кассы/кошелька (только для confirmed транзакций) ─────
 def get_state(chat_id: int) -> dict:
@@ -309,7 +333,8 @@ def set_chat_setting(chat_id: int, **kw):
     with db() as conn:
         conn.execute("INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (chat_id,))
         allowed = ("chat_type", "confirm_mode", "reminders_on",
-                   "last_backup_ts", "last_backup_remind", "pay_date", "last_pay_remind")
+                   "last_backup_ts", "last_backup_remind", "pay_date", "last_pay_remind",
+                   "linked_main_chat_id", "tasks_chat_id")
         for k, v in kw.items():
             if k in allowed:
                 conn.execute(f"UPDATE chat_settings SET {k} = ? WHERE chat_id = ?", (v, chat_id))
@@ -411,22 +436,112 @@ def is_access_allowed(user_id: int, chat_id: int) -> bool:
     return False
 
 
+# ───── Ожидающие оплаты (сделки в кредит) ─────
+def get_pending_payments(chat_id: int) -> list:
+    """
+    Все сделки в статусе 'ждём деньги' (paid=0) по данному main-чату.
+    Отсортированы: сначала где надо принять деньги (продал в кредит),
+    потом где надо отдать (купил в кредит).
+    """
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE chat_id = ? AND status = 'confirmed' "
+            "AND paid = 0 AND type IN ('sell', 'buy') ORDER BY id",
+            (chat_id,)).fetchall()
+    return list(rows)
+
+
+def get_receivables(chat_id: int) -> tuple:
+    """
+    Дебиторка/кредиторка по неоплаченным сделкам.
+
+    Возвращает (to_receive_rub, to_pay_rub, by_client_receive, by_client_pay):
+      to_receive_rub  — всего клиенты нам должны отдать (₽) за проданный им USDT
+      to_pay_rub      — всего мы должны отдать (₽) за купленный у клиентов USDT
+      by_client_*     — dict {root_имени: [(display_name, amount, tx_id), ...]}
+    """
+    rows = get_pending_payments(chat_id)
+    by_receive = {}
+    by_pay = {}
+    total_receive = 0.0
+    total_pay = 0.0
+    for r in rows:
+        cp = r["counterparty"] or "—"
+        root = name_root(cp)
+        entry = (cp, r["rubles"], r["id"])
+        if r["type"] == "sell":
+            by_receive.setdefault(root, []).append(entry)
+            total_receive += r["rubles"]
+        elif r["type"] == "buy":
+            by_pay.setdefault(root, []).append(entry)
+            total_pay += r["rubles"]
+    return total_receive, total_pay, by_receive, by_pay
+
+
+def mark_paid(chat_id: int, tx_id: int) -> dict:
+    """
+    Отмечает сделку оплаченной: paid=1, применяет balance, обновляет paid_at.
+    Возвращает {'ok': bool, 'row': row, 'msg': str}.
+    """
+    with db() as conn:
+        row = conn.execute("SELECT * FROM transactions WHERE id = ? AND chat_id = ?",
+                           (tx_id, chat_id)).fetchone()
+        if not row:
+            return {"ok": False, "row": None, "msg": f"Сделка #{tx_id} не найдена."}
+        if row["type"] not in ("sell", "buy"):
+            return {"ok": False, "row": row,
+                    "msg": f"Сделка #{tx_id} не может быть 'оплачена' (тип {row['type']})."}
+        if _tx_get(row, "paid", 1):
+            return {"ok": False, "row": row, "msg": f"Сделка #{tx_id} уже оплачена."}
+        conn.execute("UPDATE transactions SET paid = 1, paid_at = ? WHERE id = ?",
+                     (datetime.utcnow().isoformat(), tx_id))
+    # Применяем balance (теперь paid=1, apply_balance примет)
+    row_dict = dict(row); row_dict["paid"] = 1
+    apply_balance(chat_id, row_dict)
+    return {"ok": True, "row": row, "msg": "ok"}
+
+
+def get_linked_tasks_chat(main_chat_id: int):
+    """Возвращает chat_id чата задач, привязанного к этому main-чату, или None."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT tasks_chat_id FROM chat_settings WHERE chat_id = ?",
+            (main_chat_id,)).fetchone()
+    if row and row["tasks_chat_id"]:
+        return int(row["tasks_chat_id"])
+    return None
+
+
+def get_linked_main_chat(tasks_chat_id: int):
+    """Возвращает chat_id main-чата, к которому привязан этот tasks-чат."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT linked_main_chat_id FROM chat_settings WHERE chat_id = ?",
+            (tasks_chat_id,)).fetchone()
+    if row and row["linked_main_chat_id"]:
+        return int(row["linked_main_chat_id"])
+    return None
+
+
 # ───── Сохранение транзакций ─────
 def save_tx(chat_id, type_, counterparty, rubles, *, usdt=0, rate=0, raw="",
             doer=None, status="confirmed", batch_id=None,
             usdt_in=0, usdt_out=0, partner_in=None, partner_out=None,
-            currency="rub", from_personal=0, ref_name=None, ref_percent=None) -> int:
+            currency="rub", from_personal=0, ref_name=None, ref_percent=None,
+            paid=1, task_chat_id=None, task_message_id=None) -> int:
     with db() as conn:
         cur = conn.execute(
             "INSERT INTO transactions "
             "(chat_id, ts, type, counterparty, doer, usdt, rate, rubles, raw_text, "
             " status, batch_id, usdt_in, usdt_out, partner_in, partner_out, "
-            " currency, from_personal, ref_name, ref_percent) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " currency, from_personal, ref_name, ref_percent, "
+            " paid, task_chat_id, task_message_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (chat_id, datetime.utcnow().isoformat(), type_, counterparty, doer,
              usdt, rate, rubles, raw, status, batch_id,
              usdt_in, usdt_out, partner_in, partner_out,
-             currency, 1 if from_personal else 0, ref_name, ref_percent)
+             currency, 1 if from_personal else 0, ref_name, ref_percent,
+             1 if paid else 0, task_chat_id, task_message_id)
         )
         return cur.lastrowid
 
@@ -1359,6 +1474,15 @@ def parse_trade(text: str):
     """USDT-сделка. Возвращает dict или None."""
     text = text.strip().lstrip("+-—– ").strip()
 
+    # Отрежем хвост «в кредит» / «потом» / «долг» / «должен»
+    paid = True
+    m_credit = re.search(
+        r"\s+(в\s+кредит|потом|в\s+долг|долгом|должен|должна|должны|позже)\s*$",
+        text, re.IGNORECASE)
+    if m_credit:
+        paid = False
+        text = text[:m_credit.start()].strip()
+
     # Вырезаем хвост с реферером: «… от Иван 0.1%» или «… от @vasya 0.5 %»
     # Должен быть в самом конце, после основной сделки.
     ref_name = None
@@ -1418,6 +1542,7 @@ def parse_trade(text: str):
         "rubles": round(rubles, 2),
         "ref_name": ref_name,
         "ref_percent": ref_percent,
+        "paid": paid,
     }
 
 
@@ -1834,6 +1959,13 @@ def apply_balance(chat_id: int, tx_row) -> None:
     t = tx_row["type"]
     currency = _tx_get(tx_row, "currency", "rub") or "rub"
     from_personal = bool(_tx_get(tx_row, "from_personal", 0))
+    paid = bool(_tx_get(tx_row, "paid", 1))
+
+    # Сделка в кредит: кассу и USDT НЕ трогаем до момента оплаты.
+    # Реферальные обязательства, арбитражный доход и «личные» долги
+    # применяются независимо от paid — они не про физическое движение денег.
+    if not paid and t in ("sell", "buy"):
+        return
 
     if t == "sell":
         update_state(chat_id, d_rubles=tx_row["rubles"], d_usdt=-tx_row["usdt"])
@@ -1872,6 +2004,11 @@ def reverse_balance(chat_id: int, tx_row) -> None:
     t = tx_row["type"]
     currency = _tx_get(tx_row, "currency", "rub") or "rub"
     from_personal = bool(_tx_get(tx_row, "from_personal", 0))
+    paid = bool(_tx_get(tx_row, "paid", 1))
+
+    # Если сделка в кредит и не была оплачена — балансы не трогались, откатывать нечего.
+    if not paid and t in ("sell", "buy"):
+        return
 
     if t == "sell":
         update_state(chat_id, d_rubles=-tx_row["rubles"], d_usdt=tx_row["usdt"])
@@ -2286,14 +2423,38 @@ async def on_settype(message: Message):
             "Доступные:\n"
             "• `/settype main` — твой личный чат (все операции)\n"
             "• `/settype field` — чат сотрудника в поле\n"
-            "• `/settype common` — общая касса\n\n"
+            "• `/settype common` — общая касса\n"
+            "• `/settype tasks` — чат задач Владу (сюда бот шлёт задачи на сбор денег)\n\n"
             "Тип меняет только подсказки и шаблоны в `/help`, а команды и парсер работают одинаково.",
             parse_mode="Markdown")
         return
     new_type = parts[1].strip().lower()
-    if new_type not in ("main", "field", "common"):
-        await message.answer("Тип должен быть main, field или common.")
+    if new_type not in ("main", "field", "common", "tasks"):
+        await message.answer("Тип должен быть main, field, common или tasks.")
         return
+
+    # Особая обработка для tasks: привязываем к main-чату владельца
+    if new_type == "tasks":
+        if not OWNER_ID or message.from_user.id != OWNER_ID:
+            await message.answer(
+                "🔒 Только владелец может назначить чат типа `tasks`.",
+                parse_mode="Markdown")
+            return
+        # Привязываем этот чат к main-чату владельца (личка с ботом = user_id)
+        main_chat_id = OWNER_ID
+        set_chat_setting(message.chat.id, chat_type="tasks",
+                         linked_main_chat_id=main_chat_id)
+        set_chat_setting(main_chat_id, tasks_chat_id=message.chat.id)
+        await message.answer(
+            f"✅ Тип чата: *tasks*\n\n"
+            f"Этот чат привязан к твоему личному учёту.\n"
+            f"Сюда автоматически будут приходить задачи на сбор денег "
+            f"когда ты записываешь сделку в кредит.\n\n"
+            f"Все нажимают кнопки под задачами — я закрываю сделки в учёте.\n\n"
+            f"_Отвязать: `/settype main` (или удали бота из чата)._",
+            parse_mode="Markdown")
+        return
+
     set_chat_setting(message.chat.id, chat_type=new_type)
     await message.answer(f"✅ Тип чата: *{new_type}*\n\nНовая памятка — /help", parse_mode="Markdown")
 
@@ -2322,39 +2483,56 @@ async def on_confirm_cmd(message: Message):
 
 @dp.message(Command("balance"))
 async def on_balance(message: Message):
-    s = get_state(message.chat.id)
-    text = f"💰 *Касса:* {fmt_rub(s['ruble_balance'])}\n💵 *Кошелёк:* {fmt_usdt(s['usdt_balance'])}"
+    # Для tasks-чата — показываем баланс main-чата к которому он привязан
+    linked_main = get_linked_main_chat(message.chat.id)
+    chat_id = linked_main if linked_main else message.chat.id
+
+    s = get_state(chat_id)
+    text = f"💰 *Касса в руках:* {fmt_rub(s['ruble_balance'])}\n💵 *Кошелёк:* {fmt_usdt(s['usdt_balance'])}"
     arb_total = s.get("arb_profit_usdt", 0) or 0
     if arb_total:
         text += f"\n💼 *Доход с арбитража:* {fmt_usdt(arb_total)}"
     if s["extra_rubles"]:
         text += f"\n♻️ *Лишние:* {fmt_rub(s['extra_rubles'])}"
 
-    # Сколько pending
+    # Сколько pending (не подтверждённые кнопкой)
     with db() as conn:
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM transactions WHERE chat_id = ? AND status = 'pending'",
-            (message.chat.id,)).fetchone()["c"]
+            (chat_id,)).fetchone()["c"]
     if pending:
         text += f"\n⏳ Не подтверждено: *{pending}* (см. /pending)"
 
-    # Чистый капитал с учётом долгов
-    debts = get_debts(message.chat.id)
+    # ── Сделки в кредит (ждём деньги / должны отдать) ──
+    total_receive, total_pay, _, _ = get_receivables(chat_id)
+    if total_receive > 0.01 or total_pay > 0.01:
+        # Бумажная касса = реальная + дебиторка − кредиторка
+        paper_cash = s["ruble_balance"] + total_receive - total_pay
+        text += "\n\n📄 *Бумажная касса* (если бы все сделки закрылись):"
+        text += f"\n   {fmt_rub(paper_cash)}"
+        if total_receive > 0.01:
+            text += f"\n   📥 Клиенты должны отдать: +{fmt_rub(total_receive)}"
+        if total_pay > 0.01:
+            text += f"\n   📤 Мы должны отдать: −{fmt_rub(total_pay)}"
+        text += f"\n   _Подробнее: /pending\\_payments_"
+
+    # Чистый капитал с учётом долгов (займы/долги — не путать с кредитом сделок)
+    debts = get_debts(chat_id)
     owed_to_us = debts["total_owed_to_us"]
     we_owe = debts["total_we_owe"]
     if owed_to_us > 0.01 or we_owe > 0.01:
         net_capital = s["ruble_balance"] + owed_to_us - we_owe
-        text += "\n\n📊 *С учётом долгов:*"
+        text += "\n\n💳 *С учётом займов:*"
         if owed_to_us > 0.01:
-            text += f"\n   📥 Нам должны: +{fmt_rub(owed_to_us)}"
+            text += f"\n   📥 Займы нам: +{fmt_rub(owed_to_us)}"
         if we_owe > 0.01:
-            text += f"\n   📤 Мы должны: −{fmt_rub(we_owe)}"
+            text += f"\n   📤 Наши займы: −{fmt_rub(we_owe)}"
         text += f"\n   ─────────────"
-        text += f"\n   💎 *Чистый капитал: {fmt_rub(net_capital)}*"
+        text += f"\n   💎 *С займами: {fmt_rub(net_capital)}*"
         text += "\n   _Подробнее: /debts_"
 
     # Краткая сводка по курсам текущего цикла
-    cycle = get_avg_rates(message.chat.id, period="cycle")
+    cycle = get_avg_rates(chat_id, period="cycle")
     if cycle["avg_buy"] or cycle["avg_sell"]:
         text += "\n\n📊 *Цикл:*"
         if cycle["avg_buy"]:
@@ -2367,6 +2545,104 @@ async def on_balance(message: Message):
         text += "\n   _Подробнее: /rates_"
 
     await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message(Command("pending_payments"))
+async def on_pending_payments(message: Message):
+    """Список сделок ждущих оплаты."""
+    linked_main = get_linked_main_chat(message.chat.id)
+    chat_id = linked_main if linked_main else message.chat.id
+
+    tr, tp, br, bp = get_receivables(chat_id)
+    if tr < 0.01 and tp < 0.01:
+        await message.answer("✅ Нет открытых сделок в кредит.")
+        return
+
+    lines = ["📄 *Сделки в ожидании оплаты*"]
+
+    if tr > 0.01:
+        lines.append(f"\n📥 *Нам должны отдать:* {fmt_rub(tr)}")
+        for root, entries in br.items():
+            total = sum(e[1] for e in entries)
+            name = entries[0][0]
+            if len(entries) == 1:
+                lines.append(f"   • *{name}*: {fmt_rub(total)} (сделка #{entries[0][2]:03d})")
+            else:
+                lines.append(f"   • *{name}*: {fmt_rub(total)} ({len(entries)} сделок)")
+                for cp, amt, tid in entries:
+                    lines.append(f"      #{tid:03d} — {fmt_rub(amt)}")
+
+    if tp > 0.01:
+        lines.append(f"\n📤 *Мы должны отдать:* {fmt_rub(tp)}")
+        for root, entries in bp.items():
+            total = sum(e[1] for e in entries)
+            name = entries[0][0]
+            if len(entries) == 1:
+                lines.append(f"   • *{name}*: {fmt_rub(total)} (сделка #{entries[0][2]:03d})")
+            else:
+                lines.append(f"   • *{name}*: {fmt_rub(total)} ({len(entries)} сделок)")
+                for cp, amt, tid in entries:
+                    lines.append(f"      #{tid:03d} — {fmt_rub(amt)}")
+
+    lines.append("\n_Отметить оплату:_ `/paid #142`")
+    lines.append("_Отменить (клиент кинул):_ `/undo #142`")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("paid"))
+async def on_paid(message: Message):
+    """Отметить сделку как оплаченную. /paid #142"""
+    linked_main = get_linked_main_chat(message.chat.id)
+    chat_id = linked_main if linked_main else message.chat.id
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: `/paid #142`\n"
+            "Отмечает сделку в кредит как оплаченную — деньги пришли, "
+            "касса «в руках» пополняется.",
+            parse_mode="Markdown")
+        return
+
+    m = re.match(r"^#?(\d+)$", parts[1].strip())
+    if not m:
+        await message.answer("Не понял номер сделки. Пример: `/paid #142`",
+                             parse_mode="Markdown")
+        return
+
+    tx_id = int(m.group(1))
+    result = mark_paid(chat_id, tx_id)
+    if not result["ok"]:
+        await message.answer(result["msg"])
+        return
+
+    row = result["row"]
+    s = get_state(chat_id)
+    kind = "продал" if row["type"] == "sell" else "купил у"
+    sign = "+" if row["type"] == "sell" else "−"
+    await message.answer(
+        f"✅ *Оплачено* #{tx_id:03d}\n"
+        f"   {kind} *{row['counterparty']}* — {sign}{fmt_rub(row['rubles'])}\n\n"
+        f"💰 Касса в руках: *{fmt_rub(s['ruble_balance'])}*\n"
+        f"💵 Кошелёк: *{fmt_usdt(s['usdt_balance'])}*",
+        parse_mode="Markdown")
+
+    # Если было отправлено task-сообщение — попробуем его обновить
+    task_chat = _tx_get(row, "task_chat_id")
+    task_msg = _tx_get(row, "task_message_id")
+    if task_chat and task_msg:
+        try:
+            await bot.edit_message_text(
+                chat_id=int(task_chat),
+                message_id=int(task_msg),
+                text=(f"✅ *Задача #{tx_id:03d} закрыта*\n"
+                      f"{kind} *{row['counterparty']}* — {fmt_rub(row['rubles'])}\n"
+                      f"_Оплачено {datetime.now(LOCAL_TZ).strftime('%d.%m %H:%M')}_"),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
 
 @dp.message(Command("stats"))
@@ -3546,7 +3822,8 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
                 tid = save_tx(chat_id, t, cp, p["rubles"], usdt=p["usdt"], rate=p["rate"],
                               raw=raw, doer=p.get("doer"), status="pending",
                               ref_name=p.get("ref_name"),
-                              ref_percent=p.get("ref_percent"))
+                              ref_percent=p.get("ref_percent"),
+                              paid=1 if p.get("paid", True) else 0)
             else:
                 tid = save_tx(chat_id, t, cp, p["amount"],
                               raw=raw, doer=p.get("doer"), status="pending",
@@ -3620,11 +3897,14 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
         t = p["type"]
         cp = p["counterparty"]
         if t in ("sell", "buy"):
+            paid_flag = 1 if p.get("paid", True) else 0
             tid = save_tx(chat_id, t, cp, p["rubles"], usdt=p["usdt"], rate=p["rate"],
                           raw=raw, doer=p.get("doer"), status="confirmed",
                           ref_name=p.get("ref_name"),
-                          ref_percent=p.get("ref_percent"))
-            apply_balance(chat_id, {"type": t, "usdt": p["usdt"], "rubles": p["rubles"]})
+                          ref_percent=p.get("ref_percent"),
+                          paid=paid_flag)
+            apply_balance(chat_id, {"type": t, "usdt": p["usdt"], "rubles": p["rubles"],
+                                    "paid": paid_flag})
             # Реферальное начисление, если есть
             if p.get("ref_name") and p.get("ref_percent"):
                 bonus = round(p["usdt"] * p["ref_percent"] / 100.0, 4)
@@ -3649,6 +3929,12 @@ async def handle_regular_ops(message: Message, parsed_items: list, settings: dic
                 "from_personal": p.get("from_personal", 0),
             })
         saved.append((tid, p))
+
+    # Если есть сделки в кредит — шлём задачи в tasks-чат
+    unpaid_saved = [(tid, p) for tid, p in saved
+                    if p["type"] in ("sell", "buy") and not p.get("paid", True)]
+    if unpaid_saved:
+        await _send_credit_tasks(chat_id, unpaid_saved)
 
     final = get_state(chat_id)
 
@@ -3956,6 +4242,163 @@ async def on_cancel_button(cq: CallbackQuery):
     except Exception:
         await cq.message.answer(f"❌ Отменено {n} операций.", parse_mode="Markdown")
     await cq.answer("Отменено")
+
+
+# ────────────────── ЗАДАЧИ ВЛАДУ (кредитные сделки) ──────────────────
+async def _send_credit_tasks(main_chat_id: int, unpaid_saved: list):
+    """
+    Шлёт задачи в tasks-чат для каждой сделки в кредит.
+    unpaid_saved: [(tid, parsed_dict), ...]
+    Сохраняет task_chat_id и task_message_id в БД для последующего edit.
+    """
+    tasks_chat = get_linked_tasks_chat(main_chat_id)
+    if not tasks_chat:
+        # Нет привязанного чата задач — пропускаем молча
+        return
+
+    for tid, p in unpaid_saved:
+        t = p["type"]
+        cp = p["counterparty"]
+        amount = p["rubles"]
+        usdt = p["usdt"]
+        rate = p["rate"]
+
+        if t == "sell":
+            # Мы продали USDT — надо забрать деньги у клиента
+            action = "🟢 ЗАБРАТЬ у"
+            details = f"продажа {fmt_usdt(usdt)} по {fmt_rate(rate)}"
+            btn_yes = ("✅ Принял", f"tp:{tid}")
+        else:  # buy
+            action = "🔴 ОТДАТЬ"
+            details = f"покупка {fmt_usdt(usdt)} по {fmt_rate(rate)}"
+            btn_yes = ("✅ Отдал", f"tp:{tid}")
+
+        text = (
+            f"📋 *Задача #{tid:03d}*\n"
+            f"{action} *{cp}*: {fmt_rub(amount)}\n\n"
+            f"_{details}_"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=btn_yes[0], callback_data=btn_yes[1]),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"tr:{tid}"),
+        ]])
+        try:
+            sent = await bot.send_message(tasks_chat, text, parse_mode="Markdown",
+                                          reply_markup=kb)
+            # Сохраняем ссылку для последующего edit
+            with db() as conn:
+                conn.execute(
+                    "UPDATE transactions SET task_chat_id = ?, task_message_id = ? WHERE id = ?",
+                    (tasks_chat, sent.message_id, tid))
+        except Exception as e:
+            log.exception(f"Не удалось отправить задачу в tasks-чат {tasks_chat}: {e}")
+
+
+@dp.callback_query(F.data.startswith("tp:"))
+async def on_task_paid(cq: CallbackQuery):
+    """Кнопка ✅ Принял / Отдал — сделка становится оплаченной."""
+    try:
+        tid = int(cq.data[3:])
+    except ValueError:
+        await cq.answer("Ошибка кнопки.", show_alert=True)
+        return
+
+    # Найдём сделку — она должна быть привязана к main-чату, который в свою очередь
+    # связан с текущим tasks-чатом
+    linked_main = get_linked_main_chat(cq.message.chat.id)
+    if not linked_main:
+        # Возможно кнопка нажата в самом main-чате — тогда просто берём чат
+        linked_main = cq.message.chat.id
+
+    result = mark_paid(linked_main, tid)
+    if not result["ok"]:
+        await cq.answer(result["msg"], show_alert=True)
+        return
+
+    row = result["row"]
+    who_pressed = cq.from_user.first_name or "кто-то"
+    kind = "продал" if row["type"] == "sell" else "купил у"
+
+    # Обновляем сообщение-задачу
+    try:
+        new_text = (
+            f"✅ *Задача #{tid:03d} закрыта*\n"
+            f"{kind} *{row['counterparty']}* — {fmt_rub(row['rubles'])}\n"
+            f"_Отметил: {who_pressed}, {datetime.now(LOCAL_TZ).strftime('%d.%m %H:%M')}_"
+        )
+        await cq.message.edit_text(new_text, parse_mode="Markdown", reply_markup=None)
+    except Exception:
+        pass
+    await cq.answer("Отмечено как оплачено ✅")
+
+    # Уведомляем владельца в главном чате
+    try:
+        s = get_state(linked_main)
+        await bot.send_message(
+            linked_main,
+            f"✅ *{who_pressed}* закрыл задачу #{tid:03d}\n"
+            f"{kind} *{row['counterparty']}* — {fmt_rub(row['rubles'])}\n\n"
+            f"💰 Касса в руках: *{fmt_rub(s['ruble_balance'])}*\n"
+            f"💵 Кошелёк: *{fmt_usdt(s['usdt_balance'])}*",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log.exception(f"Не удалось уведомить main-чат {linked_main}: {e}")
+
+
+@dp.callback_query(F.data.startswith("tr:"))
+async def on_task_reject(cq: CallbackQuery):
+    """Кнопка ❌ Отменить — сделка удаляется, реф-бонусы тоже."""
+    try:
+        tid = int(cq.data[3:])
+    except ValueError:
+        await cq.answer("Ошибка кнопки.", show_alert=True)
+        return
+
+    linked_main = get_linked_main_chat(cq.message.chat.id) or cq.message.chat.id
+
+    with db() as conn:
+        row = conn.execute("SELECT * FROM transactions WHERE id = ? AND chat_id = ?",
+                           (tid, linked_main)).fetchone()
+        if not row:
+            await cq.answer("Сделка не найдена (уже отменена?).", show_alert=True)
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        # Если сделка уже была оплачена — откатываем balance
+        if _tx_get(row, "paid", 1):
+            reverse_balance(linked_main, row)
+        # Удаляем реф-начисление если было
+        conn.execute(
+            "DELETE FROM transactions WHERE type = 'referral_accrued' "
+            "AND chat_id = ? AND raw_text = ?",
+            (linked_main, f"ref от #{tid:03d}"))
+        conn.execute("DELETE FROM transactions WHERE id = ?", (tid,))
+
+    who = cq.from_user.first_name or "кто-то"
+    try:
+        await cq.message.edit_text(
+            f"❌ *Задача #{tid:03d} отменена*\n"
+            f"{row['counterparty']} — {fmt_rub(row['rubles'])}\n"
+            f"_Отменил: {who}, {datetime.now(LOCAL_TZ).strftime('%d.%m %H:%M')}_",
+            parse_mode="Markdown", reply_markup=None,
+        )
+    except Exception:
+        pass
+    await cq.answer("Отменено")
+
+    # Уведомим главного
+    try:
+        await bot.send_message(
+            linked_main,
+            f"❌ *{who}* отменил задачу #{tid:03d}\n"
+            f"({row['counterparty']} — {fmt_rub(row['rubles'])} не пришло, сделка удалена)",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
 
 
 # ────────────────── ЗАПУСК ──────────────────
