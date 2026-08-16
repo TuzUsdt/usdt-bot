@@ -2771,17 +2771,17 @@ async def on_myid(message: Message):
 
 @dp.message(Command("settype"))
 async def on_settype(message: Message):
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split()
     s = get_chat_settings(message.chat.id)
     if len(parts) < 2:
         await message.answer(
             f"Сейчас тип чата: *{s['chat_type']}*\n\n"
             "Доступные:\n"
-            "• `/settype main` — твой личный чат (все операции)\n"
+            "• `/settype main` — чат где ведёшь свои сделки\n"
             "• `/settype field` — чат сотрудника в поле\n"
             "• `/settype common` — общая касса\n"
             "• `/settype tasks` — чат задач Владу (сюда бот шлёт задачи на сбор денег)\n\n"
-            "Тип меняет только подсказки и шаблоны в `/help`, а команды и парсер работают одинаково.",
+            "Тип меняет подсказки в `/help` и то как ведётся учёт.",
             parse_mode="Markdown")
         return
     new_type = parts[1].strip().lower()
@@ -2789,30 +2789,95 @@ async def on_settype(message: Message):
         await message.answer("Тип должен быть main, field, common или tasks.")
         return
 
-    # Особая обработка для tasks: привязываем к main-чату владельца
+    # Особая обработка для tasks: привязываем к main-чату
     if new_type == "tasks":
         if not OWNER_ID or message.from_user.id != OWNER_ID:
             await message.answer(
                 "🔒 Только владелец может назначить чат типа `tasks`.",
                 parse_mode="Markdown")
             return
-        # Привязываем этот чат к main-чату владельца (личка с ботом = user_id)
-        main_chat_id = OWNER_ID
+
+        # Опциональный ID main-чата: /settype tasks -1001234567890
+        main_chat_id = OWNER_ID  # по умолчанию — личка с ботом
+        if len(parts) >= 3:
+            try:
+                main_chat_id = int(parts[2])
+            except ValueError:
+                await message.answer(
+                    "Не понял ID main-чата. Пример:\n"
+                    "`/settype tasks -1001234567890`",
+                    parse_mode="Markdown")
+                return
+
         set_chat_setting(message.chat.id, chat_type="tasks",
                          linked_main_chat_id=main_chat_id)
         set_chat_setting(main_chat_id, tasks_chat_id=message.chat.id)
+        target = "твоего личного чата" if main_chat_id == OWNER_ID else f"чата `{main_chat_id}`"
         await message.answer(
             f"✅ Тип чата: *tasks*\n\n"
-            f"Этот чат привязан к твоему личному учёту.\n"
-            f"Сюда автоматически будут приходить задачи на сбор денег "
-            f"когда ты записываешь сделку в кредит.\n\n"
-            f"Все нажимают кнопки под задачами — я закрываю сделки в учёте.\n\n"
-            f"_Отвязать: `/settype main` (или удали бота из чата)._",
+            f"Этот чат привязан к учёту {target}.\n"
+            f"Сюда автоматически будут приходить задачи, "
+            f"когда там записывается сделка в кредит.\n\n"
+            f"_Перепривязать:_ `/linkmain <chat_id>`\n"
+            f"_Отвязать:_ `/settype main`",
             parse_mode="Markdown")
         return
 
     set_chat_setting(message.chat.id, chat_type=new_type)
     await message.answer(f"✅ Тип чата: *{new_type}*\n\nНовая памятка — /help", parse_mode="Markdown")
+
+
+@dp.message(Command("linkmain"))
+async def on_linkmain(message: Message):
+    """
+    Перепривязать текущий tasks-чат к другому main-чату.
+    /linkmain -1001234567890
+    Работает только в tasks-чатах и только для владельца.
+    """
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("🔒 Только владелец может менять привязку.")
+        return
+
+    s = get_chat_settings(message.chat.id)
+    if s.get("chat_type") != "tasks":
+        await message.answer(
+            "Эта команда работает только в чате задач (type=tasks).\n"
+            "Сначала сделай `/settype tasks` здесь.",
+            parse_mode="Markdown")
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        cur = s.get("linked_main_chat_id")
+        await message.answer(
+            f"Сейчас этот tasks-чат привязан к: `{cur}`\n\n"
+            f"Использование: `/linkmain -1001234567890`\n\n"
+            f"Узнать ID нужного чата: напиши там `/myid` — увидишь ID чата.",
+            parse_mode="Markdown")
+        return
+
+    try:
+        new_main = int(parts[1])
+    except ValueError:
+        await message.answer("Не понял ID. Пример: `/linkmain -1001234567890`",
+                             parse_mode="Markdown")
+        return
+
+    # Убираем старую связь с прежнего main-чата, если была
+    old_main = s.get("linked_main_chat_id")
+    if old_main and old_main != new_main:
+        try:
+            set_chat_setting(old_main, tasks_chat_id=None)
+        except Exception:
+            pass
+
+    set_chat_setting(message.chat.id, linked_main_chat_id=new_main)
+    set_chat_setting(new_main, tasks_chat_id=message.chat.id)
+    await message.answer(
+        f"✅ Привязка обновлена!\n\n"
+        f"Задачи из чата `{new_main}` теперь будут приходить сюда.\n"
+        f"Попробуй в том чате написать `Продал Тесту 100000/86 в кредит` — проверим.",
+        parse_mode="Markdown")
 
 
 @dp.message(Command("confirm"))
