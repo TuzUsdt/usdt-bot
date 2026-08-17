@@ -630,12 +630,21 @@ def get_linked_tasks_chat(main_chat_id: int):
 
 
 def get_linked_main_chat(tasks_chat_id: int):
-    """Возвращает chat_id main-чата, к которому привязан этот tasks-чат."""
+    """
+    Возвращает chat_id main-чата, к которому привязан этот tasks-чат.
+    Работает только если сам чат имеет тип 'tasks' — иначе возвращает None.
+    Это защита от «залипшей» привязки при смене типа чата.
+    """
     with db() as conn:
         row = conn.execute(
-            "SELECT linked_main_chat_id FROM chat_settings WHERE chat_id = ?",
+            "SELECT chat_type, linked_main_chat_id FROM chat_settings WHERE chat_id = ?",
             (tasks_chat_id,)).fetchone()
-    if row and row["linked_main_chat_id"]:
+    if not row:
+        return None
+    # Только tasks-чаты могут делегировать баланс/операции другому чату
+    if row["chat_type"] != "tasks":
+        return None
+    if row["linked_main_chat_id"]:
         return int(row["linked_main_chat_id"])
     return None
 
@@ -2769,6 +2778,47 @@ async def on_myid(message: Message):
         parse_mode="HTML")
 
 
+@dp.message(Command("chatinfo"))
+async def on_chatinfo(message: Message):
+    """Всё что бот знает про этот чат — для диагностики."""
+    chat_id = message.chat.id
+    s = get_chat_settings(chat_id)
+
+    with db() as conn:
+        n_tx = conn.execute(
+            "SELECT COUNT(*) AS c FROM transactions WHERE chat_id = ?",
+            (chat_id,)).fetchone()["c"]
+        state_row = conn.execute(
+            "SELECT * FROM state WHERE chat_id = ?", (chat_id,)).fetchone()
+
+    lines = [
+        f"🔍 <b>Информация о чате</b>",
+        f"",
+        f"💬 ID: <code>{chat_id}</code>",
+        f"📋 Тип: <b>{s.get('chat_type', 'main')}</b>",
+        f"🔗 Привязан к main-чату: <code>{s.get('linked_main_chat_id')}</code>",
+        f"🔗 Свой tasks-чат: <code>{s.get('tasks_chat_id')}</code>",
+        f"📊 Операций в этом чате: <b>{n_tx}</b>",
+    ]
+    if state_row:
+        lines.append(f"")
+        lines.append(f"💰 Балансы этого чата:")
+        lines.append(f"   ₽: {fmt_rub(state_row['ruble_balance'])}")
+        lines.append(f"   USDT: {fmt_usdt(state_row['usdt_balance'])}")
+        if state_row['dollar_balance']:
+            lines.append(f"   $: {fmt_usd(state_row['dollar_balance'])}")
+        if state_row['euro_balance']:
+            lines.append(f"   €: {fmt_eur(state_row['euro_balance'])}")
+
+    # Если это tasks-чат — покажем куда идут балансы
+    if s.get("chat_type") == "tasks" and s.get("linked_main_chat_id"):
+        target = s['linked_main_chat_id']
+        lines.append(f"")
+        lines.append(f"ℹ️ /balance здесь показывает баланс чата <code>{target}</code>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(Command("settype"))
 async def on_settype(message: Message):
     parts = message.text.split()
@@ -2824,6 +2874,10 @@ async def on_settype(message: Message):
         return
 
     set_chat_setting(message.chat.id, chat_type=new_type)
+    # При переходе с tasks на другой тип — обнуляем привязку к main-чату,
+    # иначе /balance будет неправильно ходить к чужому чату.
+    if s.get("chat_type") == "tasks" and new_type != "tasks":
+        set_chat_setting(message.chat.id, linked_main_chat_id=None)
     await message.answer(f"✅ Тип чата: *{new_type}*\n\nНовая памятка — /help", parse_mode="Markdown")
 
 
