@@ -2874,9 +2874,9 @@ async def on_settype(message: Message):
         return
 
     set_chat_setting(message.chat.id, chat_type=new_type)
-    # При переходе с tasks на другой тип — обнуляем привязку к main-чату,
-    # иначе /balance будет неправильно ходить к чужому чату.
-    if s.get("chat_type") == "tasks" and new_type != "tasks":
+    # linked_main_chat_id имеет смысл только для tasks-чатов.
+    # При любом другом типе — очищаем, чтобы не было залипших привязок.
+    if new_type != "tasks":
         set_chat_setting(message.chat.id, linked_main_chat_id=None)
     await message.answer(f"✅ Тип чата: *{new_type}*\n\nНовая памятка — /help", parse_mode="Markdown")
 
